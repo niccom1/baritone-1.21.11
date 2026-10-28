@@ -24,6 +24,8 @@
 
 package baritone.process;
 
+import java.util.TreeSet;
+
 /**
  * Splits a build target into horizontal bands of Y levels and hands them out one at a time.
  * <p>
@@ -48,6 +50,15 @@ public final class BuilderLayerScheduler {
      * Index of the band that is currently being worked on.
      */
     private int sliceIndex;
+
+    /**
+     * Bands that had nothing the builder could do the last time they were looked at.
+     * <p>
+     * They are not finished. They are only waiting for something the builder does not have at the moment, which is
+     * almost always a material, and they get another turn once {@link #clearDeferred()} is called. Keeping them here is
+     * what lets a long build keep going when one band runs into a missing block instead of stopping the whole job.
+     */
+    private final TreeSet<Integer> deferred = new TreeSet<>();
 
     /**
      * @param heightY     total height of the build target, in Y levels
@@ -113,6 +124,8 @@ public final class BuilderLayerScheduler {
      * @return {@code false} when there is no further band to work on
      */
     public boolean advance() {
+        // this band is finished, so it does not have to be retried later
+        deferred.remove(sliceIndex);
         int next = descending ? sliceIndex - 1 : sliceIndex + 1;
         if (next < firstSliceIndex || next > lastSliceIndex) {
             return false;
@@ -122,10 +135,56 @@ public final class BuilderLayerScheduler {
     }
 
     /**
+     * Sets the current band aside because nothing in it can be built right now, and moves the cursor on to the next
+     * band that has not been set aside yet.
+     * <p>
+     * A band that is set aside is not finished, it is only waiting for materials, so pausing the whole build over it
+     * would stall every other band as well. That is exactly what used to happen to long jobs: one band ran into a block
+     * the player did not have at hand and the build stopped dead with "Unable to do it".
+     *
+     * @return {@code false} when no band is left to work on, i.e. every band has been set aside already
+     */
+    public boolean deferSlice() {
+        deferred.add(sliceIndex);
+        int total = lastSliceIndex - firstSliceIndex + 1;
+        if (deferred.size() >= total) {
+            return false; // every band is waiting for something, so there is nothing left to try
+        }
+        int next = sliceIndex;
+        for (int i = 0; i < total; i++) {
+            next = descending ? next - 1 : next + 1;
+            if (next < firstSliceIndex || next > lastSliceIndex) {
+                // wrap around so that a band behind the cursor gets its turn before the build gives up
+                next = descending ? lastSliceIndex : firstSliceIndex;
+            }
+            if (!deferred.contains(next)) {
+                sliceIndex = next;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Gives every band that was set aside another turn, for when the player changed something that could unblock them.
+     */
+    public void clearDeferred() {
+        deferred.clear();
+    }
+
+    /**
+     * @return how many bands are currently set aside waiting to be unblocked
+     */
+    public int deferredCount() {
+        return deferred.size();
+    }
+
+    /**
      * Puts the cursor back on the first band, for when the whole target is being built again.
      */
     public void reset() {
         sliceIndex = descending ? lastSliceIndex : firstSliceIndex;
+        deferred.clear();
     }
 
     @Override

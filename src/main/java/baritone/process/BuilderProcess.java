@@ -40,6 +40,8 @@ import baritone.api.utils.input.Input;
 import baritone.pathing.movement.CalculationContext;
 import baritone.pathing.movement.Movement;
 import baritone.pathing.movement.MovementHelper;
+import baritone.utils.BaritoneLog;
+import baritone.utils.PlacedBlocks;
 import baritone.utils.BaritoneProcessHelper;
 import baritone.utils.BlockStateInterface;
 import baritone.utils.PathingCommandContext;
@@ -56,6 +58,7 @@ import net.minecraft.core.Vec3i;
 import net.minecraft.util.Tuple;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.item.context.UseOnContext;
@@ -71,6 +74,7 @@ import net.minecraft.world.phys.shapes.VoxelShape;
 import java.io.File;
 import java.io.FileInputStream;
 import java.util.*;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -78,13 +82,62 @@ import static baritone.api.pathing.movement.ActionCosts.COST_INF;
 
 public final class BuilderProcess extends BaritoneProcessHelper implements IBuilderProcess {
 
-    private static final Set<Property<?>> ORIENTATION_PROPS =
-            ImmutableSet.of(
-                    RotatedPillarBlock.AXIS, HorizontalDirectionalBlock.FACING,
-                    StairBlock.FACING, StairBlock.HALF, StairBlock.SHAPE,
-                    PipeBlock.NORTH, PipeBlock.EAST, PipeBlock.SOUTH, PipeBlock.WEST, PipeBlock.UP,
-                    TrapDoorBlock.OPEN, TrapDoorBlock.HALF
-            );
+    /**
+     * Property names that describe how a block is oriented instead of what it is made of, for the properties whose
+     * values are plain enums and whose type therefore says nothing about them.
+     */
+    private static final Set<String> ORIENTATION_PROPERTY_NAMES = ImmutableSet.of(
+            "facing", "axis", "rotation", "orientation", "half", "shape", "type", "open", "attachment", "face",
+            "hinge", "north", "east", "south", "west", "up", "down", "tilt", "wall", "side", "vertical_direction"
+    );
+
+    /** Horizontal radius of the local placement / breaking scan around the builder. */
+    private static final int LOCAL_SCAN_RADIUS = 5;
+    /**
+     * How far a wrongly-placed block may be before the builder leaves it alone until it is next to it.
+     * <p>
+     * The break scan used to reuse the placement radius, so every block within five blocks that did not match the plan
+     * was mined on the way past, even with nothing on the route: the player saw the builder stop in the middle of
+     * walking, chew through a few blocks it did not need to touch, and carry on. Two blocks is "the thing right in
+     * front of me", which is the only block worth interrupting a placement for.
+     */
+    private static final int BREAK_SCAN_RADIUS = 2;
+    /**
+     * Failed placement attempts at one position that are tolerated before the builder stops walking back to it.
+     * <p>
+     * High enough that a spot which merely has to be dug open first is not given up on, low enough that a spot no
+     * reachable side can ever satisfy cannot hold a build hostage for minutes on end.
+     */
+    private static final int PLACEMENT_STRUGGLE_LIMIT = 1200;
+    /** How long the whole-band fallback scan stays quiet after it ran, in ticks. */
+    private static final int WHOLE_BAND_RESCAN_TICKS = 10;
+    /**
+     * How many path calculations in a row may fail for the same goal before the builder gives up on the blocks it was
+     * asking about and looks at the rest of the band instead.
+     * <p>
+     * This is the "it just stands there and does nothing until I move" bug: the builder hands the same unreachable
+     * {@link GoalAdjacent} to the pathfinder every tick, the pathfinder fails every time, {@code calcFailed} arrives and
+     * nobody acts on it, so the build silently idles. A few seconds of that is enough to conclude the target is not
+     * walkable from here.
+     */
+    private static final int CALC_FAIL_STREAK_LIMIT = 60;
+    /** How many ticks the builder may sit with a goal set while no path is being followed, before treating it as stuck. */
+    private static final int IDLE_STALL_LIMIT = 200;
+    /** How many ticks a path may be followed without the player actually moving before the segment is cancelled. */
+    private static final int STILL_TICK_LIMIT = 200;
+    /**
+     * How many ticks may pass with the goal already satisfied by the player's feet while nothing is being clicked.
+     * That state can never resolve on its own, because a satisfied goal never starts a path, so the fuse is short.
+     */
+    private static final int SATISFIED_STALL_LIMIT = 40;
+    /** Offsets of each square ring, indexed by radius, so the closest candidates get tried first. */
+    private static final int[][][] LOCAL_SCAN_RINGS = buildLocalScanRings();
+    /** Vertical offsets ordered by distance from the builder's feet, for the placement scan. */
+    private static final int[] VERTICAL_ORDER_PLACE = verticalOffsetOrder(-LOCAL_SCAN_RADIUS, 1);
+    /** Same, for the breaking scan while digging from above is allowed. */
+    private static final int[] VERTICAL_ORDER_BREAK_FROM_ABOVE = verticalOffsetOrder(-1, BREAK_SCAN_RADIUS);
+    /** Same, for the breaking scan when digging from above is not allowed. */
+    private static final int[] VERTICAL_ORDER_BREAK = verticalOffsetOrder(0, BREAK_SCAN_RADIUS);
 
     private HashSet<BetterBlockPos> incorrectPositions;
     private LongOpenHashSet observedCompleted; // positions that are completed even if they're out of render distance and we can't make sure right now
@@ -98,6 +151,39 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     private BuilderLayerScheduler layerScheduler;
     private int numRepeats;
     private List<BlockState> approxPlaceable;
+    private List<Item> approxPlaceableSnapshot; // inventory contents the list above was built from
+    private int wholeBandCooldown; // ticks left before the whole-layer fallback scan may run again
+    /** Placement sides already known to produce a given desired state, so the simulation runs once per state. */
+    private final Map<BlockState, Set<Direction>> fittingPlacementSides = new HashMap<>();
+    /** Positions that stay reachable but never become placeable, and how many attempts they have eaten so far. */
+    private final Map<BetterBlockPos, Integer> placementStruggles = new HashMap<>();
+    /** Positions given up on until the next resume, so one impossible block cannot stall a whole band. */
+    private final Set<BetterBlockPos> abandonedPlacements = new HashSet<>();
+    /** Path calculations in a row that failed while the builder was asking for the goal below. */
+    private int calcFailStreak;
+    /** Ticks spent with a goal set but no path being followed, which is what "standing still doing nothing" looks like. */
+    private int idleTicks;
+    /** How many times a stall was broken since the build started, for the log. */
+    private int stallRecoveries;
+    /** The goal handed out on the previous tick, and the positions it was built from. */
+    private Goal lastGoalSent;
+    private final Set<BetterBlockPos> lastGoalTargets = new LinkedHashSet<>();
+    /** Positions whose orientation problem has already been reported, so the log says it once instead of every tick. */
+    private final Set<BlockPos> placementWarnings = new HashSet<>();
+    /** Last feet position that counted as progress, and how many ticks have passed without the player moving. */
+    private BetterBlockPos lastProgressFeet;
+    private int stillTicks;
+    /** Counts ticks so the per-tick log line can be throttled instead of filling the file. */
+    private int tickLogCounter;
+    /**
+     * The last plan that was written to the log, so the file records decisions instead of every tick.
+     */
+    private String lastPlannedSignature;
+    /** The last mining target written to the log, and the positions already reported as placed. */
+    private BetterBlockPos lastBreakLogged;
+    private final Set<BlockPos> loggedPlacements = new HashSet<>();
+    /** The last assemble summary written to the log, so unchanged counts do not repeat. */
+    private String lastAssembleSummary;
     public int stopAtHeight = 0;
 
     public BuilderProcess(Baritone baritone) {
@@ -165,14 +251,56 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         this.observedCompleted = new LongOpenHashSet();
         this.incorrectPositions = null;
         this.layerScheduler = null; // the layer cursor belongs to the schematic that was just replaced
+        this.placementStruggles.clear();
+        this.abandonedPlacements.clear();
+        this.fittingPlacementSides.clear();
+        this.placementWarnings.clear();
+        this.calcFailStreak = 0;
+        this.idleTicks = 0;
+        this.stallRecoveries = 0;
+        this.lastGoalSent = null;
+        this.lastGoalTargets.clear();
+        this.resetPlacementTracking();
     }
 
     public void resume() {
+        BaritoneLog.log("BUILD", "resume() at %s, dropped %s abandoned positions and the trimmed pending set; retrying everything",
+                feetForLog(), abandonedPlacements.size());
         paused = false;
+        // The pending set is trimmed to the blocks around the player every tick, and a pause usually leaves it reduced
+        // to the few blocks that could not be finished. Reusing that set would pause again on the very next tick, so
+        // drop it and let the next tick look at the whole target again. Bands that were set aside because they were
+        // missing materials get another turn as well: the player probably went and got them.
+        incorrectPositions = null;
+        wholeBandCooldown = 0;
+        fittingPlacementSides.clear(); // the surroundings changed while paused, so cached sides may no longer hold
+        placementStruggles.clear();
+        abandonedPlacements.clear(); // the builder may stand somewhere else now, so blocked spots deserve a retry
+        placementWarnings.clear();
+        calcFailStreak = 0;
+        idleTicks = 0;
+        stillTicks = 0;
+        lastProgressFeet = null;
+        lastGoalSent = null;
+        lastGoalTargets.clear();
+        resetPlacementTracking();
+        if (layerScheduler != null) {
+            layerScheduler.clearDeferred();
+        }
     }
 
     public void pause() {
+        BaritoneLog.log("BUILD", "pause() requested externally at %s (pending=%s, layer=%s)",
+                feetForLog(), pendingCount(), layerScheduler == null ? "<none>" : layerScheduler.toString());
         paused = true;
+    }
+
+    /**
+     * {@code resume()} and {@code pause()} can be reached from commands that run while no world is loaded, where
+     * {@code playerFeet()} throws. Logging must never be the reason the client dies, so the log gets this instead.
+     */
+    private Object feetForLog() {
+        return ctx.player() == null ? "<no player>" : ctx.playerFeet();
     }
 
     @Override
@@ -278,9 +406,15 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     private Optional<Tuple<BetterBlockPos, Rotation>> toBreakNearPlayer(BuilderCalculationContext bcc) {
         BetterBlockPos center = ctx.playerFeet();
         BetterBlockPos pathStart = baritone.getPathingBehavior().pathStart();
-        for (int dx = -5; dx <= 5; dx++) {
-            for (int dy = Baritone.settings().breakFromAbove.value ? -1 : 0; dy <= 5; dy++) {
-                for (int dz = -5; dz <= 5; dz++) {
+        int[] verticalOrder = Baritone.settings().breakFromAbove.value ? VERTICAL_ORDER_BREAK_FROM_ABOVE : VERTICAL_ORDER_BREAK;
+        // Closest ring first. The old fixed dx/dy/dz order started in the far negative corner of the 11x7x11 box, so
+        // the block the builder was standing next to could lose to one on the other side of the box and it would walk
+        // away from the work it was already beside.
+        for (int radius = 0; radius <= BREAK_SCAN_RADIUS; radius++) {
+            for (int dy : verticalOrder) {
+                for (int[] offset : LOCAL_SCAN_RINGS[radius]) {
+                    int dx = offset[0];
+                    int dz = offset[1];
                     int x = center.x + dx;
                     int y = center.y + dy;
                     int z = center.z + dz;
@@ -292,10 +426,19 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                         continue; // irrelevant
                     }
                     BlockState curr = bcc.bsi.get0(x, y, z);
-                    if (!(curr.getBlock() instanceof AirBlock) && !(curr.getBlock() == Blocks.WATER || curr.getBlock() == Blocks.LAVA) && !valid(curr, desired, false)) {
+                    // Same rule as in assemble: a scaffolding block may only be left alone where the target wants air.
+                    // Where the target wants a real block the scaffold is an obstruction and gets broken like any other.
+                    boolean ourScaffolding = desired.isAir() && PlacedBlocks.isOurs(new BetterBlockPos(x, y, z));
+                    if (!(curr.getBlock() instanceof AirBlock) && !(curr.getBlock() == Blocks.WATER || curr.getBlock() == Blocks.LAVA) && !valid(curr, desired, false)
+                            && !ourScaffolding) {
                         BetterBlockPos pos = new BetterBlockPos(x, y, z);
                         Optional<Rotation> rot = RotationUtils.reachable(ctx, pos, ctx.playerController().getBlockReachDistance());
                         if (rot.isPresent()) {
+                            if (!pos.equals(lastBreakLogged)) {
+                                lastBreakLogged = pos;
+                                BaritoneLog.log("BREAK", "mining %s: want %s, found %s, aiming %s (layer %s)",
+                                        pos, desired, curr, rot.get(), layerScheduler == null ? "<none>" : layerScheduler.toString());
+                            }
                             return Optional.of(new Tuple<>(pos, rot.get()));
                         }
                     }
@@ -311,20 +454,34 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         private final BlockPos placeAgainst;
         private final Direction side;
         private final Rotation rot;
+        /**
+         * Whether this state only comes out right if the click really lands on {@link #side}.
+         * <p>
+         * A log has a facing, and the facing is decided by the face the click hits: aiming "close enough" and clicking
+         * anyway produces the same block with the wrong axis, which the builder then has to mine and redo. Those wrong
+         * placements are where the endless mine-and-replace churn came from, so for these states the click waits for a
+         * confirmed hit instead of a roughly right look direction.
+         */
+        private final boolean strictAim;
 
-        public Placement(int hotbarSelection, BlockPos placeAgainst, Direction side, Rotation rot) {
+        public Placement(int hotbarSelection, BlockPos placeAgainst, Direction side, Rotation rot, boolean strictAim) {
             this.hotbarSelection = hotbarSelection;
             this.placeAgainst = placeAgainst;
             this.side = side;
             this.rot = rot;
+            this.strictAim = strictAim;
         }
     }
 
     private Optional<Placement> searchForPlacables(BuilderCalculationContext bcc, List<BlockState> desirableOnHotbar) {
         BetterBlockPos center = ctx.playerFeet();
-        for (int dx = -5; dx <= 5; dx++) {
-            for (int dy = -5; dy <= 1; dy++) {
-                for (int dz = -5; dz <= 5; dz++) {
+        // Closest ring first, nearest height first, so the block that is actually adjacent gets placed before the
+        // builder wanders off to one that is merely in range.
+        for (int radius = 0; radius <= LOCAL_SCAN_RADIUS; radius++) {
+            for (int dy : VERTICAL_ORDER_PLACE) {
+                for (int[] offset : LOCAL_SCAN_RINGS[radius]) {
+                    int dx = offset[0];
+                    int dz = offset[1];
                     int x = center.x + dx;
                     int y = center.y + dy;
                     int z = center.z + dz;
@@ -338,15 +495,96 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                             continue;
                         }
                         desirableOnHotbar.add(desired);
+                        BetterBlockPos candidate = new BetterBlockPos(x, y, z);
+                        if (playerIsStandingIn(x, y, z)) {
+                            // The client refuses to place a block inside the player, so aiming at this one forever can
+                            // never work. Move on; the goal machinery will walk somewhere else and come back to it.
+                            continue;
+                        }
                         Optional<Placement> opt = possibleToPlace(desired, x, y, z, bcc.bsi);
                         if (opt.isPresent()) {
+                            // Finding a placement is not the same as the click landing: the click is issued later in the
+                            // tick, only when the player is standing still and grounded. Counting this as an attempt and
+                            // giving up after a dozen of them abandoned perfectly good positions, which showed up as
+                            // blocks that never got placed at all. It stays a plain "we have work here" signal.
+                            placementStruggles.remove(candidate);
+                            PlacedBlocks.forget(candidate);
+                            if (loggedPlacements.add(candidate)) {
+                                BaritoneLog.log("PLACE", "clicking %s at %s: against %s side %s, hotbar slot %s, aim %s",
+                                        desired, candidate, opt.get().placeAgainst, opt.get().side, opt.get().hotbarSelection, opt.get().rot);
+                            }
                             return opt;
                         }
+                        // A position that stays reachable but never becomes placeable is what leaves the builder
+                        // standing next to a single block forever, and a directional block that no reachable side can
+                        // produce is the usual cause. Counting the attempts lets it be left alone instead.
+                        placementStruggles.merge(candidate, 1, Integer::sum);
                     }
                 }
             }
         }
+        if (tickLogCounter % 200 == 0) {
+            BaritoneLog.log("PLACE", "nothing placeable within %s blocks of %s; wanted states=%s, positions that keep failing=%s",
+                    LOCAL_SCAN_RADIUS, center, desirableOnHotbar.size(), placementStruggles.size());
+        }
         return Optional.empty();
+    }
+
+    /**
+     * @return whether this position holds a throwaway block the pathfinder placed for itself, in a cell the target
+     * wants empty
+     * <p>
+     * Only those cells may be left alone. Wherever the target wants a real block the scaffolding is an obstruction and
+     * has to be broken like any other: pretending it is fine leaves that block unplaced and shows up as a hole in the
+     * build, which is worse than the flicker it was meant to avoid.
+     */
+    private boolean isOurScaffolding(BetterBlockPos pos, BuilderCalculationContext bcc, BlockState current) {
+        if (!PlacedBlocks.isOurs(pos)) {
+            return false;
+        }
+        BlockState wanted = bcc.getSchematic(pos.x, pos.y, pos.z, current);
+        return wanted != null && wanted.isAir();
+    }
+
+    /**
+     * @return whether the player's own bounding box is inside this block position, which makes the client refuse the
+     * click and would otherwise keep the builder aiming at it forever
+     */
+    private boolean playerIsStandingIn(int x, int y, int z) {
+        var player = ctx.player();
+        if (player == null) {
+            return false;
+        }
+        return player.getBoundingBox().intersects(x, y, z, x + 1, y + 1, z + 1);
+    }
+
+    /**
+     * Gives up on the positions that have been reachable for a long time but never became placeable.
+     * <p>
+     * A directional block whose wanted orientation no reachable side can produce would otherwise be retried every tick
+     * forever: the goal that asks the builder to walk over there never goes away, so no layer ever reports that it has
+     * nothing left to do. Retiring such a position lets the rest of the band (and then the rest of the build) make
+     * progress, and the message says which block was left behind so it is not a silent hole.
+     */
+    private void retireImpossiblePlacements() {
+        if (placementStruggles.isEmpty()) {
+            return;
+        }
+        placementStruggles.entrySet().removeIf(entry -> {
+            if (entry.getValue() < PLACEMENT_STRUGGLE_LIMIT) {
+                return false;
+            }
+            BetterBlockPos pos = entry.getKey();
+            if (abandonedPlacements.add(pos)) {
+                BlockState state = schematic == null ? null : placeAt(pos.x, pos.y, pos.z, ctx.world().getBlockState(pos));
+                logDirect(String.format(
+                        "Cannot place %s at %s %s %s after %s attempts, leaving it for the rest of this build. "
+                                + "Stand somewhere else and resume to try it again.",
+                        state == null ? "a block" : state.getBlock().getName().getString(),
+                        pos.x, pos.y, pos.z, entry.getValue()));
+            }
+            return true;
+        });
     }
 
     public boolean placementPlausible(BlockPos pos, BlockState state) {
@@ -355,6 +593,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     }
 
     private Optional<Placement> possibleToPlace(BlockState toPlace, int x, int y, int z, BlockStateInterface bsi) {
+        // Only a block whose state depends on how it is placed is worth aiming at from four directions; for everything
+        // else a sweep would just repeat the same ray trace four times.
+        boolean directional = hasPlacementOrientation(toPlace);
         for (Direction against : Direction.values()) {
             BetterBlockPos placeAgainstPos = new BetterBlockPos(x, y, z).relative(against);
             BlockState placeAgainstState = bsi.get0(placeAgainstPos);
@@ -376,18 +617,48 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 double placeX = placeAgainstPos.x + aabb.minX * placementMultiplier.x + aabb.maxX * (1 - placementMultiplier.x);
                 double placeY = placeAgainstPos.y + aabb.minY * placementMultiplier.y + aabb.maxY * (1 - placementMultiplier.y);
                 double placeZ = placeAgainstPos.z + aabb.minZ * placementMultiplier.z + aabb.maxZ * (1 - placementMultiplier.z);
-                Rotation rot = RotationUtils.calcRotationFromVec3d(RayTraceUtils.inferSneakingEyePosition(ctx.player()), new Vec3(placeX, placeY, placeZ), ctx.playerRotations());
-                Rotation actualRot = baritone.getLookBehavior().getAimProcessor().peekRotation(rot);
-                HitResult result = RayTraceUtils.rayTraceTowards(ctx.player(), actualRot, ctx.playerController().getBlockReachDistance(), true);
-                if (result != null && result.getType() == HitResult.Type.BLOCK && ((BlockHitResult) result).getBlockPos().equals(placeAgainstPos) && ((BlockHitResult) result).getDirection() == against.getOpposite()) {
+                Rotation aim = RotationUtils.calcRotationFromVec3d(RayTraceUtils.inferSneakingEyePosition(ctx.player()), new Vec3(placeX, placeY, placeZ), ctx.playerRotations());
+                // the sweep only helps a block whose placement state depends on where the builder looks
+                List<Rotation> rotations = directional ? placementRotations(aim) : Collections.singletonList(aim);
+                for (Rotation rot : rotations) {
+                    Rotation actualRot = baritone.getLookBehavior().getAimProcessor().peekRotation(rot);
+                    HitResult result = RayTraceUtils.rayTraceTowards(ctx.player(), actualRot, ctx.playerController().getBlockReachDistance(), true);
+                    if (result == null || result.getType() != HitResult.Type.BLOCK) {
+                        continue;
+                    }
+                    BlockHitResult blockHit = (BlockHitResult) result;
+                    // the sweep turns away from the click point on purpose, so a candidate only survives when the turned
+                    // aim still hits the exact block and side that was picked
+                    if (!blockHit.getBlockPos().equals(placeAgainstPos) || blockHit.getDirection() != against.getOpposite()) {
+                        continue;
+                    }
                     OptionalInt hotbar = hasAnyItemThatWouldPlace(toPlace, result, actualRot);
                     if (hotbar.isPresent()) {
-                        return Optional.of(new Placement(hotbar.getAsInt(), placeAgainstPos, against.getOpposite(), rot));
+                        return Optional.of(new Placement(hotbar.getAsInt(), placeAgainstPos, against.getOpposite(), rot, hasPlacementOrientation(toPlace)));
                     }
                 }
             }
         }
         return Optional.empty();
+    }
+
+    /**
+     * @return the look directions worth trying for one candidate placement point, the plain aim first
+     * <p>
+     * Where the builder looks decides what a directional block becomes while it is placed: a hopper ends up facing away
+     * from the player, a piston and a dispenser face the same way the player does, a dropper the same, so looking
+     * straight at the click point can be the one angle that produces a state the schematic does not ask for. Sweeping
+     * the four horizontal directions gives the block a chance to come out in the wanted orientation from the very spot
+     * the builder already stands on. Each turned direction is re-traced and dropped unless it still hits the same block
+     * and side, so nothing can be placed against the wrong face because of this.
+     */
+    private static List<Rotation> placementRotations(Rotation aim) {
+        List<Rotation> rotations = new ArrayList<>(4);
+        rotations.add(aim);
+        for (int quarter = 1; quarter < 4; quarter++) {
+            rotations.add(new Rotation(aim.getYaw() + 90 * quarter, aim.getPitch()));
+        }
+        return rotations;
     }
 
     private OptionalInt hasAnyItemThatWouldPlace(BlockState desired, HitResult result, Rotation rot) {
@@ -396,32 +667,113 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             if (stack.isEmpty() || !(stack.getItem() instanceof BlockItem)) {
                 continue;
             }
-            float originalYaw = ctx.player().getYRot();
-            float originalPitch = ctx.player().getXRot();
-            // the state depends on the facing of the player sometimes
-            ctx.player().setYRot(rot.getYaw());
-            ctx.player().setXRot(rot.getPitch());
-            BlockPlaceContext meme = new BlockPlaceContext(new UseOnContext(
-                    ctx.world(),
-                    ctx.player(),
-                    InteractionHand.MAIN_HAND,
-                    stack,
-                    (BlockHitResult) result
-            ) {}); // that {} gives us access to a protected constructor lmfao
-            BlockState wouldBePlaced = ((BlockItem) stack.getItem()).getBlock().getStateForPlacement(meme);
-            ctx.player().setYRot(originalYaw);
-            ctx.player().setXRot(originalPitch);
-            if (wouldBePlaced == null) {
+            // Building the placement context and asking the block for its placement state is not cheap, and this runs
+            // for every candidate position of the local scan. When the slot holds a different block than the one the
+            // schematic wants, no orientation can make it match, so there is nothing worth simulating here.
+            if (approxPlaceable != null && i < approxPlaceable.size()
+                    && approxPlaceable.get(i).getBlock() != desired.getBlock()) {
                 continue;
             }
-            if (!meme.canPlace()) {
-                continue;
-            }
-            if (valid(wouldBePlaced, desired, true)) {
+            BlockState wouldBePlaced = simulatePlacement(stack, result, rot);
+            if (wouldBePlaced != null && valid(wouldBePlaced, desired, true)) {
                 return OptionalInt.of(i);
             }
         }
         return OptionalInt.empty();
+    }
+
+    /**
+     * Ask the block itself what it turns into when the item in {@code stack} is placed against the clicked block while
+     * the player looks along {@code rot}.
+     * <p>
+     * This is the one place that knows the placement rule of every block, vanilla or modded, so both the placement
+     * search and the choice of which side to walk to go through it instead of re-deriving one rule per block.
+     *
+     * @return the state that would be placed, or null when the block declines to be placed there
+     */
+    private BlockState simulatePlacement(ItemStack stack, HitResult result, Rotation rot) {
+        BlockPlaceContext context = placeContext(stack, result);
+        BlockState placed = simulatePlacementState(context, rot);
+        // the position itself has to accept a block as well, not just the state it would turn into
+        if (placed == null || !withPlayerRotation(rot, context::canPlace)) {
+            return null;
+        }
+        return placed;
+    }
+
+    /**
+     * @return the state the block would take, ignoring whether the spot itself can currently be built on
+     * <p>
+     * Used to learn which sides a state can be reached from: that answer belongs to the block's own rule and must not
+     * depend on what currently stands next to one particular position, so it stays valid for every other position and
+     * can be cached.
+     */
+    private BlockState simulatePlacementState(BlockPlaceContext context, Rotation rot) {
+        return withPlayerRotation(rot, () -> {
+            if (!(context.getItemInHand().getItem() instanceof BlockItem blockItem)) {
+                return null;
+            }
+            return blockItem.getBlock().getStateForPlacement(context);
+        });
+    }
+
+    /**
+     * Runs {@code action} while the player faces {@code rot}, then restores the real orientation.
+     * <p>
+     * Placement rules read the player's facing (a hopper points away from it, a piston towards it), and the client only
+     * sends its own orientation, so that is what has to be borrowed to ask the question.
+     */
+    private <T> T withPlayerRotation(Rotation rot, Supplier<T> action) {
+        float originalYaw = ctx.player().getYRot();
+        float originalPitch = ctx.player().getXRot();
+        ctx.player().setYRot(rot.getYaw());
+        ctx.player().setXRot(rot.getPitch());
+        try {
+            return action.get();
+        } finally {
+            ctx.player().setYRot(originalYaw);
+            ctx.player().setXRot(originalPitch);
+        }
+    }
+
+    private BlockPlaceContext placeContext(ItemStack stack, HitResult result) {
+        return new BlockPlaceContext(new UseOnContext(
+                ctx.world(),
+                ctx.player(),
+                InteractionHand.MAIN_HAND,
+                stack,
+                (BlockHitResult) result
+        ) {}); // that {} gives us access to a protected constructor lmfao
+    }
+
+    private static int[][][] buildLocalScanRings() {
+        int[][][] rings = new int[LOCAL_SCAN_RADIUS + 1][][];
+        for (int radius = 0; radius <= LOCAL_SCAN_RADIUS; radius++) {
+            List<int[]> offsets = new ArrayList<>();
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) == radius) {
+                        offsets.add(new int[]{dx, dz});
+                    }
+                }
+            }
+            rings[radius] = offsets.toArray(new int[0][]);
+        }
+        return rings;
+    }
+
+    private static int[] verticalOffsetOrder(int min, int max) {
+        int[] order = new int[max - min + 1];
+        int index = 0;
+        for (int distance = 0; index < order.length; distance++) {
+            if (distance >= min && distance <= max) {
+                order[index++] = distance;
+            }
+            if (distance != 0 && -distance >= min && -distance <= max) {
+                order[index++] = -distance;
+            }
+        }
+        return order;
     }
 
     private static Vec3[] aabbSideMultipliers(Direction side) {
@@ -451,13 +803,28 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         if (recursions > 100) { // onTick calls itself, don't crash
             return new PathingCommand(null, PathingCommandType.SET_GOAL_AND_PATH);
         }
-        approxPlaceable = approxPlaceable(36);
+        if (recursions == 0 && wholeBandCooldown > 0) {
+            // only the first pass of a tick counts, the recursive retries below happen within the same tick
+            wholeBandCooldown--;
+        }
+        refreshApproxPlaceable();
         if (baritone.getInputOverrideHandler().isInputForcedDown(Input.CLICK_LEFT)) {
             ticks = 5;
         } else {
             ticks--;
         }
         baritone.getInputOverrideHandler().clearAllKeys();
+        if (recursions == 0) {
+            // calcFailed means the path calculation for the goal handed out on the previous tick came back empty. That
+            // used to be ignored completely, which is what let a build idle forever while asking for an unreachable
+            // spot: nothing failed loudly, nothing retried differently, the same goal just went out again.
+            if (calcFailed) {
+                calcFailStreak++;
+            } else {
+                calcFailStreak = 0;
+            }
+            logTickState(calcFailed, isSafeToCancel);
+        }
         if (paused) {
             return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
         }
@@ -518,6 +885,12 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             // slicing or layered building was turned off part way through, so stop restricting the schematic
             schematic = realSchematic;
         }
+        if (recursions == 0 && calcFailStreak >= CALC_FAIL_STREAK_LIMIT) {
+            // The pathfinder has been unable to produce anything for the same goal for a few seconds straight, so the
+            // blocks behind that goal cannot be walked to from where the builder is standing. Set them aside and look
+            // at the rest of the band instead of repeating the same doomed request until the player nudges the mouse.
+            escapeStall("the pathfinder failed " + calcFailStreak + " times in a row for " + describeGoal(lastGoalSent));
+        }
         BuilderCalculationContext bcc = new BuilderCalculationContext();
         if (!recalc(bcc)) {
             if (slicingActive()) {
@@ -558,36 +931,51 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             trim();
         }
 
-        Optional<Tuple<BetterBlockPos, Rotation>> toBreak = toBreakNearPlayer(bcc);
-        if (toBreak.isPresent() && isSafeToCancel && ctx.player().onGround()) {
-            // we'd like to pause to break this block
-            // only change look direction if it's safe (don't want to fuck up an in progress parkour for example
-            Rotation rot = toBreak.get().getB();
-            BetterBlockPos pos = toBreak.get().getA();
-            baritone.getLookBehavior().updateTarget(rot, true);
-            MovementHelper.switchToBestToolFor(ctx, bcc.get(pos));
-            if (ctx.player().isCrouching()) {
-                // really horrible bug where a block is visible for breaking while sneaking but not otherwise
-                // so you can't see it, it goes to place something else, sneaks, then the next tick it tries to break
-                // and is unable since it's unsneaked in the intermediary tick
-                baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
-            }
-            if (ctx.isLookingAt(pos) || ctx.playerRotations().isReallyCloseTo(rot)) {
-                baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_LEFT, true);
-            }
-            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
-        }
+        // Placing is tried before breaking. The other order made the builder mine every wrong-state block inside its
+        // reach on the way past, walk off with the holes still open, and only come back for them near the end of the
+        // layer - which is exactly "it breaks a few blocks for no reason and refills them much later".
         List<BlockState> desirableOnHotbar = new ArrayList<>();
         Optional<Placement> toPlace = searchForPlacables(bcc, desirableOnHotbar);
+        retireImpossiblePlacements();
         if (toPlace.isPresent() && isSafeToCancel && ctx.player().onGround() && ticks <= 0) {
             Rotation rot = toPlace.get().rot;
             baritone.getLookBehavior().updateTarget(rot, true);
             ctx.player().getInventory().setSelectedSlot(toPlace.get().hotbarSelection);
+            // Every placement is made while sneaking. Removing it was tried and reverted: without the sneak the click
+            // lands differently often enough (the support eats it, the player edge-slides while the click goes out)
+            // that blocks came out in the wrong state and had to be mined and redone, which cost far more time than the
+            // one tick the crouch takes.
             baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
-            if ((ctx.isLookingAt(toPlace.get().placeAgainst) && ((BlockHitResult) ctx.objectMouseOver()).getDirection().equals(toPlace.get().side)) || ctx.playerRotations().isReallyCloseTo(rot)) {
+            boolean hitConfirmed = ctx.isLookingAt(toPlace.get().placeAgainst) && ((BlockHitResult) ctx.objectMouseOver()).getDirection().equals(toPlace.get().side);
+            if (hitConfirmed || (!toPlace.get().strictAim && ctx.playerRotations().isReallyCloseTo(rot))) {
                 baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_RIGHT, true);
             }
             return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+        }
+
+        // Breaking waits until the player has arrived: while a path is being followed, whatever is in the way is the
+        // pathfinder's business (it prices breaking in itself), and a builder that mines mid-walk is only leaving holes
+        // behind it. Standing still at the work, the wrong block right next to it is worth clearing.
+        if (!baritone.getPathingBehavior().isPathing()) {
+            Optional<Tuple<BetterBlockPos, Rotation>> toBreak = toBreakNearPlayer(bcc);
+            if (toBreak.isPresent() && isSafeToCancel && ctx.player().onGround()) {
+                // we'd like to pause to break this block
+                // only change look direction if it's safe (don't want to fuck up an in progress parkour for example
+                Rotation rot = toBreak.get().getB();
+                BetterBlockPos pos = toBreak.get().getA();
+                baritone.getLookBehavior().updateTarget(rot, true);
+                MovementHelper.switchToBestToolFor(ctx, bcc.get(pos));
+                if (ctx.player().isCrouching()) {
+                    // really horrible bug where a block is visible for breaking while sneaking but not otherwise
+                    // so you can't see it, it goes to place something else, sneaks, then the next tick it tries to break
+                    // and is unable since it's unsneaked in the intermediary tick
+                    baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
+                }
+                if (ctx.isLookingAt(pos) || ctx.playerRotations().isReallyCloseTo(rot)) {
+                    baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_LEFT, true);
+                }
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+            }
         }
 
         if (Baritone.settings().allowInventory.value) {
@@ -596,7 +984,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             outer:
             for (BlockState desired : desirableOnHotbar) {
                 for (int i = 0; i < 9; i++) {
-                    if (valid(approxPlaceable.get(i), desired, true)) {
+                    if (couldPlaceFrom(approxPlaceable.get(i), desired)) {
                         usefulSlots.add(i);
                         continue outer;
                     }
@@ -607,7 +995,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             outer:
             for (int i = 9; i < 36; i++) {
                 for (BlockState desired : noValidHotbarOption) {
-                    if (valid(approxPlaceable.get(i), desired, true)) {
+                    if (couldPlaceFrom(approxPlaceable.get(i), desired)) {
                         if (!baritone.getInventoryBehavior().attemptToPutOnHotbar(i, usefulSlots::contains)) {
                             // awaiting inventory move, so pause
                             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
@@ -619,34 +1007,198 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
 
         // Only the pocket the builder is standing next to is handed to the pathfinder, so that the route it plans is
-        // a short local one instead of a trip to the far corner of the layer.
+        // a short local one instead of a trip to the far corner of the layer. With allowInventory the whole inventory
+        // counts rather than just the hotbar: a block sitting in the main inventory is one inventory move away from
+        // being placeable, and counting only the hotbar is what made the builder call it a missing material.
+        List<BlockState> reachablePlaceable = Baritone.settings().allowInventory.value ? approxPlaceable : approxPlaceable.subList(0, 9);
         Collection<BetterBlockPos> sweepPocket = selectSweepPocket();
-        Goal goal = assemble(bcc, approxPlaceable.subList(0, 9), false, sweepPocket);
+        Goal goal = assemble(bcc, reachablePlaceable, false, sweepPocket);
         if (goal == null && sweepPocket != incorrectPositions) {
             // this pocket has nothing left that we can do from here, so let the rest of the layer have a turn
-            goal = assemble(bcc, approxPlaceable.subList(0, 9));
+            goal = assemble(bcc, reachablePlaceable);
         }
         if (goal == null) {
             goal = assemble(bcc, approxPlaceable, true); // we're far away, so assume that we have our whole inventory to recalculate placeable properly
-            if (goal == null) {
-                if (Baritone.settings().skipFailedLayers.value && slicingActive()) {
-                    logDirect("Skipping layer that I cannot construct! " + layerScheduler);
-                    if (layerScheduler.advance()) {
-                        incorrectPositions = null;
-                        return onTick(calcFailed, isSafeToCancel, recursions + 1);
-                    }
-                    logDirect("No further layers are left to construct");
-                } else if (Baritone.settings().skipFailedLayers.value && Baritone.settings().buildInLayers.value && layer * Baritone.settings().layerHeight.value < realSchematic.heightY()) {
-                    logDirect("Skipping layer that I cannot construct! Layer #" + layer);
-                    layer++;
+        }
+        if (goal == null) {
+            // The pending set is trimmed to what is around the player and the pocket narrows it further, so a band that
+            // looks impossible from here can still have plenty of work left a few blocks away. Look at all of it before
+            // concluding that the build cannot continue.
+            goal = assembleWholeBand(bcc);
+        }
+        if (goal == null) {
+            if (Baritone.settings().skipFailedLayers.value && slicingActive()) {
+                logDirect("Skipping layer that I cannot construct! " + layerScheduler);
+                if (layerScheduler.advance()) {
+                    incorrectPositions = null;
                     return onTick(calcFailed, isSafeToCancel, recursions + 1);
                 }
-                logDirect("Unable to do it. Pausing. resume to resume, cancel to cancel");
-                paused = true;
-                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                logDirect("No further layers are left to construct");
+            } else if (Baritone.settings().skipFailedLayers.value && Baritone.settings().buildInLayers.value && layer * Baritone.settings().layerHeight.value < realSchematic.heightY()) {
+                logDirect("Skipping layer that I cannot construct! Layer #" + layer);
+                layer++;
+                return onTick(calcFailed, isSafeToCancel, recursions + 1);
+            }
+            // Nothing in this band can be built right now, but that is a statement about this band and not about the
+            // build. Set it aside and give the remaining bands a turn instead of freezing the whole job over a single
+            // block; every band is treated the same way, and only when none of them has anything left to do does the
+            // build actually pause.
+            if (slicingActive() && layerScheduler.deferSlice()) {
+                logDirect("Nothing to do in that layer yet, moving on to " + layerScheduler);
+                incorrectPositions = null;
+                return onTick(calcFailed, isSafeToCancel, recursions + 1);
+            }
+            logDirect("Unable to do it. Pausing. resume to resume, cancel to cancel");
+            BaritoneLog.log("PAUSE", "no goal could be assembled: layer=%s pending=%s abandoned=%s struggles=%s feet=%s. The ASSEMBLE/MISSING/PLACE lines above say why every candidate was rejected.",
+                    layerScheduler == null ? "<none>" : layerScheduler.toString(), pendingCount(),
+                    abandonedPlacements.size(), placementStruggles.size(), feetForLog());
+            paused = true;
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+        lastGoalSent = goal;
+        if (recursions == 0) {
+            var pathingBehavior = baritone.getPathingBehavior();
+            boolean pathing = pathingBehavior.isPathing();
+            boolean clicking = baritone.getInputOverrideHandler().isInputForcedDown(Input.CLICK_LEFT)
+                    || baritone.getInputOverrideHandler().isInputForcedDown(Input.CLICK_RIGHT);
+            BetterBlockPos feet = ctx.playerFeet();
+            // The builder's goals are "walk next to the block I want to touch". When the player already stands next to
+            // that block the goal counts as satisfied, so PathingBehavior.secretInternalSetGoalAndPath returns without
+            // ever calculating a path: no path, no click, no error, and the build sits there until the player happens to
+            // move. That is the "it only continues after I walk somewhere" report, so this case gets a much shorter
+            // fuse than a goal that is simply hard to reach.
+            boolean goalSatisfied = goal != null && goal.isInGoal(feet);
+            if (!feet.equals(lastProgressFeet)) {
+                lastProgressFeet = feet;
+                stillTicks = 0;
+                idleTicks = 0;
+            } else {
+                stillTicks++;
+            }
+            if (!pathing && !clicking) {
+                int limit = goalSatisfied ? SATISFIED_STALL_LIMIT : IDLE_STALL_LIMIT;
+                if (++idleTicks >= limit) {
+                    escapeStall(goalSatisfied
+                            ? "standing at " + feet + " already satisfies " + describeGoal(goal) + " but nothing could be done from there"
+                            : "no progress for " + idleTicks + " ticks (no path, no clicks) on goal " + describeGoal(goal));
+                    return onTick(calcFailed, isSafeToCancel, recursions + 1);
+                }
+            } else if (pathing && stillTicks >= STILL_TICK_LIMIT) {
+                // A path exists and is being followed, but the player has not moved a single block for ten seconds:
+                // the executor is walking into terrain it cannot handle. Cancel the segment so the next calculation is
+                // free to pick a different route, and set aside the target that led into the dead end.
+                escapeStall("the current path has not moved the player for " + stillTicks + " ticks, cancelling the segment");
+                pathingBehavior.forceCancel();
+                return onTick(calcFailed, isSafeToCancel, recursions + 1);
             }
         }
         return new PathingCommandContext(goal, PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH, bcc);
+    }
+
+    /**
+     * A short, readable name for a goal, shared with the path event log.
+     */
+    private static String describeGoal(Goal goal) {
+        return BaritoneLog.goal(goal);
+    }
+
+    private int pendingCount() {
+        return incorrectPositions == null ? 0 : incorrectPositions.size();
+    }
+
+    /**
+     * Forgets what the builder has learned about clicks and log throttling.
+     * <p>
+     * A resume, a new build or a lost control are all moments where the player may have walked somewhere else, so the
+     * click counters and the scaffolding registry must not carry over: an old "give up on this position" must not stop
+     * a retry, and a scaffold from ten minutes ago must not stop the builder from digging out a block that really is in
+     * the way.
+     */
+    private void resetPlacementTracking() {
+        loggedPlacements.clear();
+        lastPlannedSignature = null;
+        lastBreakLogged = null;
+        lastAssembleSummary = null;
+        PlacedBlocks.clear();
+    }
+
+    /**
+     * Records the builder's plan whenever it changes: which layer it is on, how much work it thinks is left, what it has
+     * given up on, and which target it is handing to the pathfinder.
+     * <p>
+     * A tick is fifty milliseconds, so a per-tick line is a wall of text within a minute and says nothing a reader can
+     * use. Only transitions are written now, together with a path calculation failure, and the file stays small enough
+     * to actually read after something went wrong.
+     */
+    private void logTickState(boolean calcFailed, boolean isSafeToCancel) {
+        if (!BaritoneLog.enabled()) {
+            return;
+        }
+        tickLogCounter++;
+        var pathing = baritone.getPathingBehavior();
+        Goal current = pathing == null ? null : pathing.getGoal();
+        boolean pathingNow = pathing != null && pathing.isPathing();
+        String band = layerScheduler == null ? "<none>" : layerScheduler.toString();
+        // The signature has to be stable while nothing meaningful changes. Counting in the failing-position total or the
+        // current pathing flag made it flip several times a second and the log turned into the wall of text it replaced.
+        String signature = band + "|" + pendingCount() + "|" + abandonedPlacements.size();
+        boolean heartbeat = tickLogCounter % 200 == 0;
+        if (!heartbeat && !calcFailed && signature.equals(lastPlannedSignature)) {
+            return;
+        }
+        lastPlannedSignature = signature;
+        BaritoneLog.log("PLAN",
+                "feet=%s layer=%s pending=%s abandoned=%s struggles=%s pathing=%s calcFailStreak=%s calcFailedNow=%s safeCancel=%s ticks=%s placeable=%s inventory=%s -> target %s",
+                feetForLog(),
+                band,
+                pendingCount(),
+                abandonedPlacements.size(),
+                placementStruggles.size(),
+                pathingNow,
+                calcFailStreak,
+                calcFailed,
+                isSafeToCancel,
+                ticks,
+                approxPlaceable.size(),
+                Baritone.settings().allowInventory.value ? "whole inventory" : "hotbar only",
+                describeGoal(current));
+    }
+
+    /**
+     * Stops the build from sitting on a target it cannot actually reach.
+     * <p>
+     * The builder hands one goal to the pathfinder per tick. When that goal is unreachable the pathfinder simply fails,
+     * every tick, forever: nothing throws, nothing is printed, and the only thing that changes the outcome is the player
+     * walking somewhere else. This gives up on the blocks behind that goal for the rest of the build, throws away the
+     * trimmed pending set so the whole band is looked at again, and lets the normal flow pick new work.
+     *
+     * @param reason a human readable description of what was stuck, written to the log
+     */
+    private void escapeStall(String reason) {
+        stallRecoveries++;
+        BaritoneLog.section("STALL RECOVERY #" + stallRecoveries + " - " + reason);
+        BaritoneLog.log("STALL", "feet=%s goal=%s pending=%s targets=%s",
+                ctx.playerFeet(), describeGoal(lastGoalSent), pendingCount(), lastGoalTargets);
+        int abandoned = 0;
+        // A single goal is built from a handful of positions. Abandoning all of them is fine for a pocket, but when the
+        // goal came from the whole-band fallback that would throw away everything the band still has to offer, so the
+        // cleanup only applies to a reasonably sized target set.
+        if (lastGoalTargets.size() <= 64) {
+            for (BetterBlockPos pos : lastGoalTargets) {
+                if (abandonedPlacements.add(pos)) {
+                    abandoned++;
+                    BaritoneLog.log("STALL", "  giving up on %s for the rest of this build; resume gives it another try", pos);
+                }
+            }
+        }
+        BaritoneLog.log("STALL", "dropped %s positions, discarding the trimmed pending set and rescanning the band", abandoned);
+        incorrectPositions = null; // trimmed to a pocket around the player, so it cannot answer "what is left to do"
+        fittingPlacementSides.clear(); // a walk failed, not a side; the cached sides are still valid, but the world moved
+        wholeBandCooldown = 0;
+        calcFailStreak = 0;
+        idleTicks = 0;
+        lastGoalSent = null;
+        lastGoalTargets.clear();
     }
 
     private boolean recalc(BuilderCalculationContext bcc) {
@@ -654,6 +1206,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             incorrectPositions = new HashSet<>();
             fullRecalc(bcc);
             if (incorrectPositions.isEmpty()) {
+                BaritoneLog.log("RECALC", "fresh scan of %s found nothing to do", bandDescription());
                 return false;
             }
         }
@@ -662,6 +1215,13 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             fullRecalc(bcc);
         }
         return !incorrectPositions.isEmpty();
+    }
+
+    private String bandDescription() {
+        if (!slicingActive()) {
+            return "the whole target";
+        }
+        return "band " + layerScheduler + " (y " + layerScheduler.sliceMinY() + ".." + layerScheduler.sliceMaxY() + ")";
     }
 
     private void trim() {
@@ -700,6 +1260,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
 
     private void fullRecalc(BuilderCalculationContext bcc) {
         incorrectPositions = new HashSet<>();
+        // a full pass means the world around the target may have changed, so sides that could not produce a wanted
+        // orientation before deserve another simulation instead of staying cached as impossible
+        fittingPlacementSides.clear();
         // when the build is being sliced, only scan the band that is currently being worked on: blocks outside it
         // are somebody else's turn, and collecting them would make the goal set span the whole target again
         int minY = 0;
@@ -929,12 +1492,15 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         Map<BlockState, Integer> missing = new HashMap<>();
         List<BetterBlockPos> outOfBounds = new ArrayList<>();
         candidates.forEach(pos -> {
+            if (abandonedPlacements.contains(pos)) {
+                return; // already failed to place here for long enough; the next resume gives it another chance
+            }
             BlockState state = bcc.bsi.get0(pos);
             if (state.getBlock() instanceof AirBlock) {
                 BlockState desired = bcc.getSchematic(pos.x, pos.y, pos.z, state);
                 if (desired == null) {
                     outOfBounds.add(pos);
-                } else if (containsBlockState(approxPlaceable, desired)) {
+                } else if (couldPlaceAs(desired, approxPlaceable)) {
                     placeable.add(pos);
                 } else {
                     missing.put(desired, 1 + missing.getOrDefault(desired, 0));
@@ -949,17 +1515,47 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                     } else {
                         flowingLiquids.add(pos);
                     }
+                } else if (isOurScaffolding(pos, bcc, state)) {
+                    // A throwaway block the pathfinder put here for itself while climbing, in a cell the target wants
+                    // empty. Digging it out only makes the next path put it back, which is the loop where the builder
+                    // and its own path fight over the same block. Cells the target wants filled are NOT skipped: there
+                    // the scaffolding is in the way of a real block and has to be removed like any other obstruction.
                 } else {
                     breakable.add(pos);
                 }
             }
         });
         incorrectPositions.removeAll(outOfBounds);
+        // Remember what this goal will be built from. If the pathfinder cannot produce a route to it, these are the
+        // positions that have to be given up on, so a stall can be escaped precisely instead of by resetting everything.
+        lastGoalTargets.clear();
+        for (BetterBlockPos pos : placeable) {
+            lastGoalTargets.add(pos);
+        }
+        for (BetterBlockPos pos : breakable) {
+            lastGoalTargets.add(pos);
+        }
+        for (BetterBlockPos pos : sourceLiquids) {
+            lastGoalTargets.add(pos);
+        }
+        String assembleSummary = String.format("candidates=%s (%s) -> placeable=%s breakable=%s sourceLiquid=%s flowingLiquid=%s missing=%s outOfBounds=%s",
+                candidates.size(),
+                candidates == incorrectPositions ? "whole pending set" : "pocket",
+                placeable.size(), breakable.size(), sourceLiquids.size(), flowingLiquids.size(),
+                missing.size(), outOfBounds.size());
+        if (!assembleSummary.equals(lastAssembleSummary)) {
+            lastAssembleSummary = assembleSummary;
+            BaritoneLog.log("ASSEMBLE", "%s", assembleSummary);
+        }
         List<Goal> toBreak = new ArrayList<>();
         breakable.forEach(pos -> toBreak.add(breakGoal(pos, bcc)));
         List<Goal> toPlace = new ArrayList<>();
+        // "does the block under this one belong to the same column" is asked once per entry, so looking the answer up
+        // in a list made assembling the goals quadratic in the size of the slice - on a big band that alone stalled
+        // the tick. A set keeps it linear.
+        Set<BetterBlockPos> placeableLookup = new HashSet<>(placeable);
         placeable.forEach(pos -> {
-            if (!placeable.contains(pos.below()) && !placeable.contains(pos.below(2))) {
+            if (!placeableLookup.contains(pos.below()) && !placeableLookup.contains(pos.below(2))) {
                 toPlace.add(placementGoal(pos, bcc));
             }
         });
@@ -970,6 +1566,15 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
         if (toBreak.isEmpty()) {
             if (logMissing && !missing.isEmpty()) {
+                BaritoneLog.log("MISSING", "the builder thinks it has none of: %s", missing.entrySet().stream()
+                        .map(e -> {
+                            // The distinction that matters when reading this: if the same Block is in the inventory, the
+                            // judgement is wrong (a state that only differs in orientation, which is exactly the bug this
+                            // log exists to catch). If it is not, the player really is short of that item.
+                            boolean haveBlock = approxPlaceable.stream().anyMatch(candidate -> candidate.getBlock() == e.getKey().getBlock());
+                            return String.format("%sx %s (block in inventory: %s)", e.getValue(), e.getKey(), haveBlock);
+                        })
+                        .collect(Collectors.joining(", ")));
                 logDirect("Missing materials for at least:");
                 logDirect(missing.entrySet().stream()
                         .map(e -> String.format("%sx %s", e.getValue(), e.getKey()))
@@ -984,6 +1589,34 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             return null;
         }
         return new GoalComposite(toBreak.toArray(new Goal[0]));
+    }
+
+    /**
+     * Re-scans the band that is currently being worked on from scratch and tries to assemble a goal out of all of it.
+     * <p>
+     * {@link #incorrectPositions} is trimmed to a radius around the player on every tick and {@link #selectSweepPocket}
+     * narrows it down further, so "nothing to do" is only ever a statement about that small neighbourhood. This check is
+     * what decides whether the whole band really has nothing left that the builder could do right now.
+     *
+     * @return a goal assembled from the whole band, or {@code null} when the band has nothing left to do at all
+     */
+    private Goal assembleWholeBand(BuilderCalculationContext bcc) {
+        if (wholeBandCooldown > 0) {
+            // This path rescans the entire band and reassembles every goal in it, which is far too expensive to repeat
+            // on every tick when it just came up empty. Letting the layer cursor move on during the cooldown keeps the
+            // job flowing without spending the whole tick budget on a scan that is not going to find anything new.
+            return null;
+        }
+        wholeBandCooldown = WHOLE_BAND_RESCAN_TICKS;
+        HashSet<BetterBlockPos> nearby = incorrectPositions;
+        fullRecalc(bcc);
+        Goal goal = assemble(bcc, approxPlaceable, true);
+        if (incorrectPositions.isEmpty()) {
+            // an empty set is read as "the band is finished" and would move the cursor along without building anything,
+            // so keep the set we came in with when the fresh scan found nothing at all
+            incorrectPositions = nearby;
+        }
+        return goal;
     }
 
     public static class JankyGoalComposite implements Goal {
@@ -1073,13 +1706,101 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
         boolean allowSameLevel = !(ctx.world().getBlockState(pos.above()).getBlock() instanceof AirBlock);
         BlockState current = ctx.world().getBlockState(pos);
+        BlockState desired = bcc.getSchematic(pos.getX(), pos.getY(), pos.getZ(), current);
+        if (desired == null || !placementPlausible(pos, desired)) {
+            return new GoalPlace(pos);
+        }
+        Goal fallback = null;
         for (Direction facing : Movement.HORIZONTALS_BUT_ALSO_DOWN_____SO_EVERY_DIRECTION_EXCEPT_UP) {
             //noinspection ConstantConditions
-            if (MovementHelper.canPlaceAgainst(ctx, pos.relative(facing)) && placementPlausible(pos, bcc.getSchematic(pos.getX(), pos.getY(), pos.getZ(), current))) {
+            if (!MovementHelper.canPlaceAgainst(ctx, pos.relative(facing))) {
+                continue;
+            }
+            if (fallback == null) {
+                fallback = new GoalAdjacent(pos, pos.relative(facing), allowSameLevel);
+            }
+            // A directional block only comes out with the orientation the schematic asks for when the builder can reach
+            // the right side of it. Walking up to whichever side happens to have something to click is what left the
+            // builder standing next to a hopper that would not point at its chest, placing nothing for the rest of the
+            // session. The side is now picked by asking the block instead of assuming that any side will do.
+            if (placementSideFits(pos, facing, desired)) {
                 return new GoalAdjacent(pos, pos.relative(facing), allowSameLevel);
             }
         }
-        return new GoalPlace(pos);
+        if (placementWarnings.add(pos)) {
+            // Every approachable side was simulated and none of them produces this state, so the build will keep asking
+            // for it and never get it. Worth saying out loud once, with the state that was asked for.
+            BaritoneLog.log("ORIENT", "no reachable side of %s produces %s; known fitting sides=%s, falling back to %s",
+                    pos, desired, fittingPlacementSides.get(desired),
+                    fallback == null ? "GoalPlace" : fallback.toString());
+        }
+        return fallback == null ? new GoalPlace(pos) : fallback;
+    }
+
+    /**
+     * @return whether a builder that reaches the {@code side} of {@code pos} would place {@code desired} there
+     * <p>
+     * The rule that decides this lives inside the block: a hopper ends up facing away from the player, a piston towards
+     * them, a stair takes its shape from its surroundings. It is asked, not duplicated here, and the answer per state is
+     * cached because a build repeats the same handful of states thousands of times.
+     */
+    private boolean placementSideFits(BlockPos pos, Direction side, BlockState desired) {
+        if (desired == null || !hasPlacementOrientation(desired)) {
+            return true; // nothing about this block depends on where the builder stands
+        }
+        Set<Direction> fitting = fittingPlacementSides.get(desired);
+        if (fitting == null) {
+            fitting = computeFittingPlacementSides(pos, desired);
+            fittingPlacementSides.put(desired, fitting);
+        }
+        return fitting.contains(side);
+    }
+
+    /**
+     * @return every side of a block on which the builder can stand and still place {@code desired}
+     */
+    private Set<Direction> computeFittingPlacementSides(BlockPos pos, BlockState desired) {
+        Set<Direction> fitting = new HashSet<>();
+        ItemStack stack = new ItemStack(desired.getBlock().asItem());
+        if (stack.isEmpty() || !(stack.getItem() instanceof BlockItem)) {
+            return fitting; // not something that can be placed by hand; leave the decision to the placement search
+        }
+        for (Direction side : Direction.values()) {
+            if (side == Direction.UP) {
+                continue; // there is nothing to stand on above the block
+            }
+            if (sideWouldPlace(stack, pos, side, desired)) {
+                fitting.add(side);
+            }
+        }
+        return fitting;
+    }
+
+    /**
+     * @return whether standing on {@code side} of {@code pos} and looking at the block would place {@code desired}
+     */
+    private boolean sideWouldPlace(ItemStack stack, BlockPos pos, Direction side, BlockState desired) {
+        BlockPos placeAgainst = pos.relative(side);
+        Direction clickedFace = side.getOpposite();
+        Vec3 clickLocation = new Vec3(
+                placeAgainst.getX() + 0.5 + clickedFace.getStepX() * 0.5,
+                placeAgainst.getY() + 0.5 + clickedFace.getStepY() * 0.5,
+                placeAgainst.getZ() + 0.5 + clickedFace.getStepZ() * 0.5);
+        Vec3 eyePosition = new Vec3(
+                placeAgainst.getX() + 0.5 - clickedFace.getStepX(),
+                placeAgainst.getY() + 0.5,
+                placeAgainst.getZ() + 0.5 - clickedFace.getStepZ());
+        Rotation aim = RotationUtils.calcRotationFromVec3d(eyePosition,
+                new Vec3(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5), ctx.playerRotations());
+        BlockHitResult hit = new BlockHitResult(clickLocation, clickedFace, placeAgainst, false);
+        BlockPlaceContext context = placeContext(stack, hit);
+        for (Rotation rot : placementRotations(aim)) {
+            BlockState placed = simulatePlacementState(context, rot);
+            if (placed != null && valid(placed, desired, true)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private Goal breakGoal(BlockPos pos, BuilderCalculationContext bcc) {
@@ -1200,7 +1921,19 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         layer = Baritone.settings().startAtLayer.value;
         numRepeats = 0;
         paused = false;
+        wholeBandCooldown = 0;
+        fittingPlacementSides.clear();
+        placementStruggles.clear();
+        abandonedPlacements.clear();
+        placementWarnings.clear();
+        calcFailStreak = 0;
+        idleTicks = 0;
+        stillTicks = 0;
+        lastProgressFeet = null;
+        lastGoalSent = null;
+        lastGoalTargets.clear();
         observedCompleted = null;
+        resetPlacementTracking();
     }
 
     @Override
@@ -1230,6 +1963,24 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         return Optional.empty();
     }
 
+    /**
+     * Rebuilds {@link #approxPlaceable} only when something actually moved in the inventory. Every entry costs a
+     * placement state query and the list is consulted by the placement scan and by the pathfinder's placement cost on
+     * every tick, so rebuilding it on a tick where the inventory did not change is pure waste.
+     */
+    private void refreshApproxPlaceable() {
+        List<ItemStack> items = ctx.player().getInventory().getNonEquipmentItems();
+        List<Item> snapshot = new ArrayList<>(36);
+        for (int i = 0; i < 36; i++) {
+            snapshot.add(items.get(i).getItem());
+        }
+        if (approxPlaceable != null && snapshot.equals(approxPlaceableSnapshot)) {
+            return;
+        }
+        approxPlaceableSnapshot = snapshot;
+        approxPlaceable = approxPlaceable(36);
+    }
+
     private List<BlockState> approxPlaceable(int size) {
         List<BlockState> result = new ArrayList<>();
         for (int i = 0; i < size; i++) {
@@ -1256,6 +2007,38 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         return result;
     }
 
+    /**
+     * @return whether {@code property} is decided by how a block is placed rather than by what the block is
+     * <p>
+     * A hard-coded list of {@link Property} instances can never be complete. Every block declares its own instances, so
+     * {@code HopperBlock.FACING} is a different object from {@code HorizontalDirectionalBlock.FACING} even though both
+     * are a {@code DirectionProperty} called {@code facing}, and a block added by another mod brings its own objects
+     * that no list written here could contain. The old instance list therefore classified a hopper aimed at a chest as
+     * a state the player cannot carry, and the build paused announcing a missing material the player was holding.
+     * Recognising the property by the type of its values, and by its name for the plain enums, covers every block.
+     */
+    private static boolean isPlacementOrientation(Property<?> property) {
+        for (Comparable<?> value : property.getPossibleValues()) {
+            if (value instanceof Direction || value instanceof Direction.Axis) {
+                return true;
+            }
+        }
+        return ORIENTATION_PROPERTY_NAMES.contains(property.getName());
+    }
+
+    /**
+     * @return whether {@code state} carries a property that the placement decides, i.e. whether the block can come out
+     * in more than one orientation
+     */
+    private static boolean hasPlacementOrientation(BlockState state) {
+        for (Map.Entry<Property<?>, Comparable<?>> entry : state.getValues().entrySet()) {
+            if (entry.getKey().getPossibleValues().size() > 1 && isPlacementOrientation(entry.getKey())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static boolean sameBlockstate(BlockState first, BlockState second) {
         if (first.getBlock() != second.getBlock()) {
             return false;
@@ -1269,7 +2052,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         Map<Property<?>, Comparable<?>> map2 = second.getValues();
         for (Property<?> prop : map1.keySet()) {
             if (map1.get(prop) != map2.get(prop)
-                    && !(ignoreDirection && ORIENTATION_PROPS.contains(prop))
+                    && !(ignoreDirection && isPlacementOrientation(prop))
                     && !ignoredProps.contains(prop.getName())) {
                 return false;
             }
@@ -1284,6 +2067,36 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             }
         }
         return false;
+    }
+
+    /**
+     * @return whether something we are carrying could end up being {@code desired}
+     * <p>
+     * This answers "do I carry this block", which is all a material check can honestly answer. The state an item ends
+     * up in is decided while it is placed, by the face that gets clicked and by the side the builder stands on: a
+     * hopper pointed at a chest, a log with an axis, a stair with its shape, or anything a mod gives its own property
+     * instances. None of those states can exist inside an inventory, so demanding an exact match reported carried
+     * blocks as missing materials and paused the build. The placement path re-derives the state from the real hit
+     * result in {@link #hasAnyItemThatWouldPlace} and validates it strictly there, so being lenient here cannot place
+     * the wrong block: it can only fail to find a spot for it, which the layer scheduler handles without pausing.
+     */
+    private static boolean couldPlaceAs(BlockState desired, List<BlockState> placeable) {
+        if (containsBlockState(placeable, desired)) {
+            return true;
+        }
+        for (BlockState candidate : placeable) {
+            if (candidate.getBlock() == desired.getBlock()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @return whether the item in one inventory slot could end up being {@code desired} once it is placed
+     */
+    private static boolean couldPlaceFrom(BlockState candidate, BlockState desired) {
+        return valid(candidate, desired, true) || candidate.getBlock() == desired.getBlock();
     }
 
     private static boolean valid(BlockState current, BlockState desired, boolean itemVerify) {
@@ -1324,7 +2137,21 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
 
         public BuilderCalculationContext() {
             super(BuilderProcess.this.baritone, true); // wew lad
-            this.placeable = approxPlaceable(9);
+            // The pathfinder prices every block it wants to place from this list, and a block that is not in it costs
+            // COST_INF unless the builder happens to carry a throwaway block. Judging the whole target against the
+            // hotbar alone therefore marked perfectly buildable steps as impossible, and a path with one impossible
+            // step is thrown away and recalculated instead of being walked - which is what made long jobs stand still
+            // and then report that it had nothing to do. With allowInventory the whole inventory counts, because a
+            // block in the main inventory is one inventory move away from being placeable.
+            //
+            // The list the tick already built is reused rather than rebuilt here: this context is constructed once per
+            // tick and every entry costs a placement state query.
+            List<BlockState> placeableNow = BuilderProcess.this.approxPlaceable;
+            if (placeableNow != null && placeableNow.size() >= 36) {
+                this.placeable = Baritone.settings().allowInventory.value ? placeableNow : placeableNow.subList(0, 9);
+            } else {
+                this.placeable = approxPlaceable(Baritone.settings().allowInventory.value ? 36 : 9);
+            }
             this.schematic = BuilderProcess.this.schematic;
             this.originX = origin.getX();
             this.originY = origin.getY();
@@ -1355,7 +2182,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                     // this won't be a schematic block, this will be a throwaway
                     return placeBlockCost * Baritone.settings().placeIncorrectBlockPenaltyMultiplier.value; // we're going to have to break it eventually
                 }
-                if (placeable.contains(sch)) {
+                if (couldPlaceAs(sch, placeable)) {
                     return 0; // thats right we gonna make it FREE to place a block where it should go in a structure
                     // no place block penalty at all 😎
                     // i'm such an idiot that i just tried to copy and paste the epic gamer moment emoji too

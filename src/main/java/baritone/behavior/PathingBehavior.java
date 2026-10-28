@@ -33,6 +33,7 @@ import baritone.pathing.calc.AbstractNodeCostSearch;
 import baritone.pathing.movement.CalculationContext;
 import baritone.pathing.movement.MovementHelper;
 import baritone.pathing.path.PathExecutor;
+import baritone.utils.BaritoneLog;
 import baritone.utils.PathRenderer;
 import baritone.utils.PathingCommandContext;
 import baritone.utils.pathing.Favoring;
@@ -64,6 +65,8 @@ public final class PathingBehavior extends Behavior implements IPathingBehavior,
     private boolean pausedThisTick;
     private boolean cancelRequested;
     private boolean calcFailedLastTick;
+    /** The last path event line written to the debug log, so identical repeats are not written again. */
+    private String lastLoggedPathLine;
 
     private volatile AbstractNodeCostSearch inProgress;
     private final Object pathCalcLock = new Object();
@@ -89,8 +92,34 @@ public final class PathingBehavior extends Behavior implements IPathingBehavior,
         toDispatch.drainTo(curr);
         calcFailedLastTick = curr.contains(PathEvent.CALC_FAILED);
         for (PathEvent event : curr) {
+            // Logging is the only reason this line touches pathStart(), and pathStart() reads playerFeet(): during the
+            // ticks that run before a world (or after it is gone) the player does not exist yet. Both the enabled()
+            // check and safePathStart() exist so a log line can never take the client down.
+            if (BaritoneLog.enabled()) {
+                // The builder cancels and re-issues a path almost every tick, so what matters is the transition (which
+                // event, heading where), not each repetition. Repeats of the same line are dropped, and the goal goes
+                // through the compact formatter: a raw composite goal stringifies to four kilobytes per line, which is
+                // what filled the file's whole size budget within minutes.
+                String line = String.format("event %s | goal=%s start=%s pathing=%s current=%s next=%s inProgress=%s",
+                        event,
+                        BaritoneLog.goal(goal),
+                        safePathStart(),
+                        isPathing(),
+                        current == null ? "<none>" : current.getPath().getDest().toShortString(),
+                        next == null ? "<none>" : next.getPath().getDest().toShortString(),
+                        inProgress == null ? "<none>" : inProgress.getClass().getSimpleName());
+                if (!line.equals(lastLoggedPathLine)) {
+                    lastLoggedPathLine = line;
+                    BaritoneLog.log("PATH", "%s", line);
+                }
+            }
             baritone.getGameEventHandler().onPathEvent(event);
         }
+    }
+
+    /** {@link #pathStart()} throws while there is no player, which is the case on ticks outside a world. */
+    private String safePathStart() {
+        return ctx.player() == null ? "<no player>" : pathStart().toShortString();
     }
 
     @Override
@@ -102,6 +131,10 @@ public final class PathingBehavior extends Behavior implements IPathingBehavior,
             return;
         }
 
+        if (ctx.player() == null) {
+            // Ticks keep arriving between the main menu and a loaded world, and pathStart() reads playerFeet().
+            return;
+        }
         expectedSegmentStart = pathStart();
         baritone.getPathingControlManager().preTick();
         tickPath();
@@ -502,12 +535,17 @@ public final class PathingBehavior extends Behavior implements IPathingBehavior,
             logDebug("Simplifying " + goal.getClass() + " to GoalXZ due to distance");
         }
         inProgress = pathfinder;
+        BaritoneLog.log("PATH", "calculating from %s to %s (goal %s), primaryTimeout=%sms failureTimeout=%sms, planAhead=%s",
+                start.toShortString(), BaritoneLog.goal(goal), BaritoneLog.goal(pathfinder.getGoal()), primaryTimeout, failureTimeout, current != null);
         Baritone.getExecutor().execute(() -> {
             if (talkAboutIt) {
                 logDebug("Starting to search for path from " + start + " to " + goal);
             }
 
             PathCalculationResult calcResult = pathfinder.calculate(primaryTimeout, failureTimeout);
+            BaritoneLog.log("PATH", "calculation finished: %s, goal=%s, start=%s, path=%s",
+                    calcResult.getType(), BaritoneLog.goal(goal), start.toShortString(),
+                    calcResult.getPath().map(path -> path.length() + " movements to " + path.getDest().toShortString()).orElse("<no path>"));
             synchronized (pathPlanLock) {
                 Optional<PathExecutor> executor = calcResult.getPath().map(p -> new PathExecutor(PathingBehavior.this, p));
                 if (current == null) {

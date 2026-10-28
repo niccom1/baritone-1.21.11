@@ -25,6 +25,7 @@ import baritone.api.utils.BetterBlockPos;
 import baritone.api.utils.Helper;
 import baritone.api.utils.PathCalculationResult;
 import baritone.pathing.movement.CalculationContext;
+import baritone.utils.BaritoneLog;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 
 import java.util.Optional;
@@ -102,12 +103,24 @@ public abstract class AbstractNodeCostSearch implements IPathFinder, Helper {
             throw new IllegalStateException("Path finder cannot be reused!");
         }
         cancelRequested = false;
+        long startedAt = System.nanoTime();
         try {
             IPath path = calculate0(primaryTimeout, failureTimeout).map(IPath::postProcess).orElse(null);
+            long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
             if (cancelRequested) {
+                BaritoneLog.log("CALC", "%s: cancelled after %sms for goal %s from %s",
+                        getClass().getSimpleName(), elapsedMs, goal, realStart.toShortString());
                 return new PathCalculationResult(PathCalculationResult.Type.CANCELLATION);
             }
             if (path == null) {
+                // The interesting case: the search ran to completion (or ran out of time) and could not reach anything
+                // that satisfies the goal. Recording where it got to separates "this is impossible" from "the timeout
+                // is too short for this terrain".
+                BaritoneLog.log("CALC", "%s: FAILED after %sms, goal=%s, start=%s, best cost so far=%s, closest node=%s",
+                        getClass().getSimpleName(), elapsedMs, goal, realStart.toShortString(),
+                        bestSoFar[0] == null ? "<none>" : bestSoFar[0].cost,
+                        mostRecentConsidered == null ? "<none>"
+                                : mostRecentConsidered.x + " " + mostRecentConsidered.y + " " + mostRecentConsidered.z);
                 return new PathCalculationResult(PathCalculationResult.Type.FAILURE);
             }
             int previousLength = path.length();
@@ -124,8 +137,12 @@ public abstract class AbstractNodeCostSearch implements IPathFinder, Helper {
                 Helper.HELPER.logDebug("Static cutoff " + previousLength + " to " + path.length());
             }
             if (goal.isInGoal(path.getDest())) {
+                BaritoneLog.log("CALC", "%s: reached the goal in %sms, %s movements, dest=%s",
+                        getClass().getSimpleName(), elapsedMs, path.length(), path.getDest().toShortString());
                 return new PathCalculationResult(PathCalculationResult.Type.SUCCESS_TO_GOAL, path);
             } else {
+                BaritoneLog.log("CALC", "%s: partial path in %sms, %s movements, dest=%s (goal not satisfied, segment only)",
+                        getClass().getSimpleName(), elapsedMs, path.length(), path.getDest().toShortString());
                 return new PathCalculationResult(PathCalculationResult.Type.SUCCESS_SEGMENT, path);
             }
         } catch (Exception e) {

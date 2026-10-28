@@ -28,6 +28,7 @@ import baritone.api.utils.input.Input;
 import baritone.pathing.movement.MovementState.MovementTarget;
 import baritone.pathing.precompute.Ternary;
 import baritone.utils.BlockStateInterface;
+import baritone.utils.PlacedBlocks;
 import baritone.utils.ToolSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -834,6 +835,7 @@ public interface MovementHelper extends ActionCosts, Helper {
                     state.setInput(Input.SNEAK, true);
                 }
                 ((Baritone) baritone).getInventoryBehavior().selectThrowawayForLocation(true, placeAt.getX(), placeAt.getY(), placeAt.getZ());
+                PlacedBlocks.remember(placeAt); // the builder must not tear down our own scaffolding
                 return PlaceResult.READY_TO_PLACE;
             }
         }
@@ -842,6 +844,7 @@ public interface MovementHelper extends ActionCosts, Helper {
                 state.setInput(Input.SNEAK, true);
             }
             ((Baritone) baritone).getInventoryBehavior().selectThrowawayForLocation(true, placeAt.getX(), placeAt.getY(), placeAt.getZ());
+            PlacedBlocks.remember(placeAt); // aiming is done, the click follows on the next tick
             return PlaceResult.ATTEMPTING;
         }
         return PlaceResult.NO_OPTION;

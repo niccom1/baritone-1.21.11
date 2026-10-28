@@ -679,6 +679,14 @@ public final class Settings {
     public final Setting<Boolean> chatDebug = new Setting<>(false);
 
     /**
+     * Write a very detailed trace of what Baritone is doing to baritonelog.txt in the save directory of the world that
+     * is loaded. Unlike chat, this records the reasoning behind every pause, every failed path calculation and every
+     * block the builder refuses to place, which is what you need when a long build silently stops making progress.
+     * Toggle with {@code #debug true} / {@code #debug false}.
+     */
+    public final Setting<Boolean> debug = new Setting<>(false);
+
+    /**
      * Allow chat based control of Baritone. Most likely should be disabled when Baritone is imported for use in
      * something else
      */

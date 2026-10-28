@@ -31,6 +31,7 @@ import baritone.command.manager.CommandManager;
 import baritone.event.GameEventHandler;
 import baritone.process.*;
 import baritone.selection.SelectionManager;
+import baritone.utils.BaritoneLog;
 import baritone.utils.BlockStateInterface;
 import baritone.utils.GuiClick;
 import baritone.utils.InputOverrideHandler;
@@ -56,6 +57,7 @@ import java.util.function.Function;
 public class Baritone implements IBaritone {
 
     private static final ThreadPoolExecutor threadPool;
+    private static boolean DEBUG_LOGGER_WRAPPED;
 
     static {
         threadPool = new ThreadPoolExecutor(4, Integer.MAX_VALUE, 60L, TimeUnit.SECONDS, new SynchronousQueue<>());
@@ -129,6 +131,17 @@ public class Baritone implements IBaritone {
         this.worldProvider = new WorldProvider(this);
         this.selectionManager = new SelectionManager(this);
         this.commandManager = new CommandManager(this);
+
+        // Mirror everything Baritone says into the on-disk debug log, so the log tells the same story the chat does.
+        if (!DEBUG_LOGGER_WRAPPED) {
+            DEBUG_LOGGER_WRAPPED = true;
+            var settings = settings();
+            settings.logger.value = settings.logger.value.andThen(component -> BaritoneLog.chat(component.getString()));
+        }
+        BaritoneLog.log("INIT", "%s | debug log %s | run dir %s",
+                this.getClass().getSimpleName(),
+                BaritoneLog.enabled() ? "ENABLED" : "disabled (use #debug true)",
+                mc.gameDirectory);
     }
 
     public void registerBehavior(IBehavior behavior) {
