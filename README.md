@@ -1,6 +1,6 @@
 # Baritone · Layered Build （分层建造 / 分层填充修改版）
 
-> ## ⚠️ 这是修改版，不是官方版本
+> ## ⚠️ 这是修改版由DeepSeek-V4.1-Flash 1017协助完成，不是官方版本
 >
 > **原项目： [cabaletta/baritone](https://github.com/cabaletta/baritone)** （作者 Brady / cabaletta，LGPL-3.0）
 >
