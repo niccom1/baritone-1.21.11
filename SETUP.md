@@ -1,94 +1,96 @@
-# Installation
+# 安装
 
-The easiest way to install Baritone is to install it as Forge/Neoforge/Fabric mod, but if you know how you can also use it with a custom `version.json`
-(Examples: [1.14.4](https://www.dropbox.com/s/rkml3hjokd3qv0m/1.14.4-Baritone.zip?dl=1), [1.15.2](https://www.dropbox.com/s/8rx6f0kts9hvd4f/1.15.2-Baritone.zip?dl=1), [1.16.5](https://www.dropbox.com/s/i6f292o2i7o9acp/1.16.5-Baritone.zip?dl=1)).
+安装 Baritone 最简单的方式是把它作为 Forge/Neoforge/Fabric 模组安装，但如果你知道怎么做，也可以用自定义的 `version.json` 来使用它
+（示例：[1.14.4](https://www.dropbox.com/s/rkml3hjokd3qv0m/1.14.4-Baritone.zip?dl=1)、[1.15.2](https://www.dropbox.com/s/8rx6f0kts9hvd4f/1.15.2-Baritone.zip?dl=1)、[1.16.5](https://www.dropbox.com/s/i6f292o2i7o9acp/1.16.5-Baritone.zip?dl=1)）。
 
-Once Baritone is installed, look [here](USAGE.md) for instructions on how to use it.
+Baritone 安装好之后，看[这里](USAGE.md)了解如何使用它。
 
-## Prebuilt official releases
+## 预构建的官方发行版
 
-Releases are made rarely and are not always up to date with the latest features and bug fixes.
+发行版很少发布，而且并不总是跟得上最新的特性和缺陷修复。
 
-Link to the releases page: [Releases](https://github.com/cabaletta/baritone/releases)
+发行版页面链接：[Releases](https://github.com/cabaletta/baritone/releases)
 
-The mapping between Minecraft versions and major Baritone versions is as follows
+Minecraft 版本与 Baritone 主要版本的对应关系如下
 
-| Minecraft version | 1.12 | 1.13 | 1.14 | 1.15 | 1.16 | 1.17 | 1.18 | 1.19 | 1.20  | 1.21  | 1.21.4 | 1.21.5 |  1.21.6 - 1.21.8 |
+| Minecraft 版本    | 1.12 | 1.13 | 1.14 | 1.15 | 1.16 | 1.17 | 1.18 | 1.19 | 1.20  | 1.21  | 1.21.4 | 1.21.5 |  1.21.6 - 1.21.8 |
 |-------------------|------|------|------|------|------|------|------|------|-------|-------|--------|--------|------------------|
-| Baritone version  | v1.2 | v1.3 | v1.4 | v1.5 | v1.6 | v1.7 | v1.8 | v1.9 | v1.10 | v1.11 | v1.13  | v1.14  | v1.15            |
+| Baritone 版本     | v1.2 | v1.3 | v1.4 | v1.5 | v1.6 | v1.7 | v1.8 | v1.9 | v1.10 | v1.11 | v1.13  | v1.14  | v1.15            |
 
-Any official release will be GPG signed by leijurv (44A3EA646EADAC6A). Please verify that the hash of the file you download is in `checksums.txt` and that `checksums_signed.asc` is a valid signature by that public keys of `checksums.txt`.
+任何官方发行版都会由 leijurv（44A3EA646EADAC6A）进行 GPG 签名。请验证你下载的文件的哈希值位于 `checksums.txt` 中，并且 `checksums_signed.asc` 是该公钥对 `checksums.txt` 的有效签名。
 
-The build is fully deterministic and reproducible, and you can verify that by running `docker build --no-cache -t cabaletta/baritone .` yourself and comparing the shasum. This works identically on Travis, Mac, and Linux (if you have docker on Windows, I'd be grateful if you could let me know if it works there too).
+构建是完全确定且可复现的，你可以自己运行 `docker build --no-cache -t cabaletta/baritone .` 并对比 shasum 来验证这一点。这在 Travis、Mac 和 Linux 上表现完全一致（如果你在 Windows 上装了 docker，并且愿意告诉我它在那里是否也能正常工作，我会非常感激）。
 
-## Artifacts
+## 构建产物
 
-Building Baritone will create the final artifacts in the ``dist`` directory. These are the same as the artifacts created in the [releases](https://github.com/cabaletta/baritone/releases).
+构建 Baritone 会在 ``dist`` 目录中生成最终产物。它们与 [releases](https://github.com/cabaletta/baritone/releases) 中创建的产物相同。
 
-**The Forge, NeoForge and Fabric releases can simply be added as a Forge/Neoforge/Fabric mods.**
+**Forge、NeoForge 和 Fabric 的发行版可以直接作为 Forge/Neoforge/Fabric 模组添加。**
 
-If another one of your other mods has a Baritone integration, you want `baritone-api-*-VERSION.jar`.
-If you want to report a bug and spare us some effort, you want `baritone-unoptimized-*-VERSION.jar`.
-Otherwise, you want `baritone-standalone-*-VERSION.jar`
+如果你的其他某个模组带有 Baritone 集成，你需要的是 `baritone-api-*-VERSION.jar`。
+如果你想报告缺陷并帮我们省点力气，你需要的是 `baritone-unoptimized-*-VERSION.jar`。
+否则，你需要的是 `baritone-standalone-*-VERSION.jar`
 
-Here's what the various qualifiers mean
+下面是各种限定词的含义
 
-- **API**: Only the non-api packages are obfuscated. This should be used in environments where other mods would like to use Baritone's features.
-- **Standalone**: Everything is obfuscated. Other mods cannot use Baritone, but you get a bit of extra performance.
-- **Unoptimized**: Nothing is obfuscated. This shouldn't be used in production, but is really helpful for crash reports.
+- **API**：只有非 api 的包会被混淆。这应该用在其他模组想要使用 Baritone 特性的环境中。
+- **Standalone**：所有内容都被混淆。其他模组无法使用 Baritone，但你能获得一点额外的性能。
+- **Unoptimized**：什么都不混淆。这不应在生产环境中使用，但对崩溃报告非常有帮助。
 
-- **No loader**: Loadable as a launchwrapper tweaker against vanilla Minecraft using a custom `version.json`.
-- **Forge/Neoforge/Fabric**: Loadable as a standard mod using the respective loader. The fabric build may or may not work on Quilt.
+- **无加载器（No loader）**：可通过自定义 `version.json`，作为针对原版 Minecraft 的 launchwrapper tweaker 加载。
+- **Forge/Neoforge/Fabric**：可使用相应加载器作为标准模组加载。Fabric 构建在 Quilt 上可能能用，也可能不能用。
 
-If you build from source you will also find mapping files in the `dist` directory. These contain the renamings done by ProGuard and are useful if you want to read obfuscated stack traces.
+如果你从源码构建，还会在 `dist` 目录中找到映射文件。它们包含 ProGuard 所做的重命名，如果你想阅读混淆后的堆栈追踪，这些文件会很有用。
 
-## Build it yourself
+## 自行构建
 
-- Clone or download Baritone
+- 克隆或下载 Baritone
 
   ![Image](https://i.imgur.com/kbqBtoN.png)
-  - If you choose to download, make sure you download the correct branch and extract the ZIP archive.
-- Follow one of the instruction sets below, based on your preference
+  - 如果你选择下载，请确保下载了正确的分支并解压 ZIP 压缩包。
+- 按你的偏好，照下面其中一组说明操作
 
-## Command Line
+## 命令行
 
-On Mac OSX and Linux, use `./gradlew` instead of `gradlew`.
+在 Mac OSX 和 Linux 上，使用 `./gradlew` 而不是 `gradlew`。
 
-The recommended Java versions by Minecraft version are
+Minecraft 版本推荐的 Java 版本如下
 
-| Minecraft version             | Java version  |
+| Minecraft 版本                | Java 版本     |
 |-------------------------------|---------------|
 | 1.12.2 - 1.16.5               | 8             |
 | 1.17.1                        | 16            |
 | 1.18.2 - 1.20.4               | 17            |
 | 1.20.5 - 1.21.8               | 21            |
 
-Download java: <https://adoptium.net/>
+下载 java：<https://adoptium.net/>
 
-To check which java version you are using do `java -version` in a command prompt or terminal.
+要检查你正在使用的 java 版本，在命令提示符或终端中执行 `java -version`。
 
-### Building Baritone
+### 构建 Baritone
 
-These tasks depend on the minecraft version, but are (for the most part) standard for building mods.
+这些任务取决于 minecraft 版本，但（大体上）是构建模组的标准做法。
 
-For more details, see [the build ci action](/.github/workflows/gradle_build.yml) of the branch you want to build.
+更多细节见你想构建的那个分支的[构建 CI action](/.github/workflows/gradle_build.yml)。
 
-For most branches `gradlew build` should build everything, but there are exceptions and this file might be out of date.
+对大多数分支来说，`gradlew build` 应该会构建全部内容，但也有例外，并且本文件可能已经过时。
 
-More specifically, on older branches the setup used to be that `gradlew build` builds the tweaker jar
-and `gradlew build -Pbaritone.forge_build` / `gradlew build -Pbaritone.fabric_build` are needed to build
-for Forge/Fabric instead. And you might have to run `setupDecompWorkspace` first.
+更具体地说，在较旧的分支上，过去的做法是 `gradlew build` 构建 tweaker jar，
+而要改为构建 Forge/Fabric 版本则需要 `gradlew build -Pbaritone.forge_build` / `gradlew build -Pbaritone.fabric_build`。
+并且你可能需要先运行 `setupDecompWorkspace`。
 
 ## IntelliJ
 
-- Open the project in IntelliJ as a Gradle project
-- Refresh the Gradle project (or, to be safe, just restart IntelliJ)
-- Depending on the minecraft version, you may need to run `setupDecompWorkspace` or `genIntellijRuns` in order to get everything working
+- 在 IntelliJ 中以 Gradle 项目方式打开该项目
+- 刷新 Gradle 项目（或者为保险起见，直接重启 IntelliJ）
+- 根据 minecraft 版本的不同，你可能需要运行 `setupDecompWorkspace` 或 `genIntellijRuns` 才能让一切正常工作
 
 ## Github Actions
 
-Most branches have a CI workflow at `.github/workflows/gradle_build.yml`. If you fork this repository and enable actions for your fork
-you can push a dummy commit to trigger it and have GitHub build Baritone for you.
+大多数分支在 `.github/workflows/gradle_build.yml` 处都有一个 CI 工作流。如果你 fork 了本仓库并为你的 fork 启用了 actions，
+你可以推一个空提交来触发它，让 GitHub 替你构建 Baritone。
 
-If the commit you want to build is less than 90 days old, you can also find the corresponding workflow run in
-[this list](https://github.com/cabaletta/baritone/actions/workflows/gradle_build.yml) and download the artifacts from there.
+如果你想构建的提交在 90 天以内，你也可以在
+[这个列表](https://github.com/cabaletta/baritone/actions/workflows/gradle_build.yml)中找到对应的工作流运行记录，并从那里下载产物。
+
+> English version: [SETUP.en.md](SETUP.en.md)

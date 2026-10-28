@@ -1,99 +1,98 @@
-# Changelog
+# 更新日志
 
-All notable changes to this layered Baritone fork, newest first.
+本仓库（Baritone 1.21.11 分层建造修改版）的所有重要改动，最新的在最前面。
 
-The fork keeps upstream Baritone's layered builder (`#litematica`, `#selection fill`) and adds the fixes below on top of it.
+这个 fork 保留了上游 Baritone 的分层建造逻辑（`#litematica`、`#selection fill`），并在其之上加下面这些修复。
 
 ---
 
 ## v1.21.11-layered.2
 
-This release is about one thing: the builder stopped being reliable on long, high-stress builds. It used to pause for no reason, misjudge which materials it had, fight itself over blocks it had just placed, and leave holes behind. Everything below addresses a concrete log or crash report from a real build session.
+这个版本只干一件事：让建造器在长时间、高压力的工程里重新变得可靠。它以前会莫名其妙地暂停、误判自己有没有材料、跟自己刚放下的方块打架、并且留下空洞。下面每一条都对应一次真实建造会话里的日志或崩溃报告。
 
-### Added — debug log (`#debug`)
+### 新增 —— 调试日志（`#debug`）
 
-`#debug true` writes `baritonelog.txt` next to the save (single player) or in the game directory, `#debug false` stops it. It is off by default.
+`#debug true` 会在存档旁边（单人）或游戏目录下写 `baritonelog.txt`，`#debug false` 停止。默认关闭。
 
-- `src/main/java/baritone/utils/BaritoneLog.java` (new) — the whole logger: `chat/log/section/exception/goal/file/writtenLines/close`, one line per event prefixed `HH:mm:ss.SSS t=<gameTime> [CATEGORY] `, flushed per line, every write wrapped so logging can never break a build.
-- Header block records what the session looked like: start time, target file, dimension, player, feet position, and a snapshot of **every** Baritone setting that is not `@JavaOnly`.
-- The file follows the world: the first line is written while Baritone is being constructed, before a world exists, so the log used to be pinned to the game directory for the whole session. It now moves to the save directory as soon as one is loaded, and never moves back.
-- Capped at 8 MB per file; on reaching the cap it writes one explanatory line and stops instead of filling the disk.
-- `src/api/java/baritone/api/Settings.java` — new `debug` setting, registered automatically like every other public `Setting` field, which is what makes `#debug true` work through the existing command parser.
-- `src/main/java/baritone/Baritone.java` — wraps `settings().logger` so chat messages also land in the file, and writes the `INIT` line.
+- `src/main/java/baritone/utils/BaritoneLog.java`（新文件）—— 整个日志器：`chat/log/section/exception/goal/file/writtenLines/close`，每个事件一行，前缀 `HH:mm:ss.SSS t=<gameTime> [CATEGORY] `，逐行 flush，所有写入都包在 try/catch 里，保证记录日志永远不会弄坏一次建造。
+- 文件头记录本次会话的样子：启动时间、目标文件、维度、玩家名、脚下坐标，以及**每一条**不是 `@JavaOnly` 的 Baritone 设置的快照。
+- 文件跟着世界走：第一行是在 Baritone 构造期间写的，那时世界还不存在，所以以前日志会整个会话被钉在游戏目录里。现在只要世界加载完成就会迁移到存档目录，并且不再迁回去。
+- 单文件上限 8 MB，达到上限时写一行说明就停止，而不是把盘写满。
 
-Categories written today: `INIT`, `CHAT`, `PLAN`, `PATH`, `CALC`, `RECALC`, `TRIM`, `BREAK`, `PLACE`, `ASSEMBLE`, `MISSING`, `ORIENT`, `PAUSE`, `BUILD`, `STALL`, `LOG`.
+### 新增 —— 背包里永远匹配不上的朝向状态
 
-### Added — directional states the inventory can never match
+对着箱子放的漏斗、`axis=x` 的原木、朝东的楼梯：物品本身一样，但只有特定的朝向才能放成目标状态。以前这些统统被判定成"缺少材料"，然后把整个建造暂停。
 
-A hopper aimed at a chest, a log with `axis=x`, a stair facing east: the item in the inventory is the same either way, but the placement only comes out right for one facing. The builder used to call all of those "missing materials" and pause the whole build.
+- **判料看的是方块，不是状态。** `couldPlaceAs(desired, placeable)` 接受背包里任何同 `Block` 的状态；能不能真放成那个朝向，留到后面拿真实世界去校验。
+- **朝向属性按"形状"识别，不再按 `Property` 实例枚举。** `isPlacementOrientation(Property)` 把值域是 `Direction`/`Direction.Axis` 的属性一律视为朝向属性，另外再认 `ORIENTATION_PROPERTY_NAMES` 里的名字。旧代码比的是 `Property` 对象，而 `HopperBlock.FACING` 跟 `HorizontalDirectionalBlock.FACING` 是**两个不同的对象**，所以漏斗永远匹配不上。这一改也顺带覆盖了自带属性实例的 mod 方块。
+- 新增：`hasPlacementOrientation`、`placementRotations(Rotation)`（视线角、+90、+180、+270）、`simulatePlacement`、`simulatePlacementState`、`withPlayerRotation`、`placeContext` —— 每个候选视线方向都会重新模拟一次放置，于是"我该站哪一面"变成了代码能自己回答的问题。
+- 新增：`placementSideFits`、`computeFittingPlacementSides`、`sideWouldPlace`，用 `fittingPlacementSides` 缓存；`placementGoal` 会走向"能放成目标朝向"的那一面，而不是"随便能点到"的第一面。
+- `Placement.strictAim` —— 带朝向的状态只有确认点中正确的面之后才会右键。对原木的 `axis` 来说"大致瞄对"是不够的：点到错的面会放出同一个方块的错误朝向，之后还得挖掉重来。
 
-- **Material check is now about the block, not the state.** `couldPlaceAs(desired, placeable)` accepts any inventory state of the same `Block`; whether the placement can actually *produce* the wanted facing is checked later, at placement time, against the real world.
-- **Orientation is recognised by shape, not by a list of `Property` instances.** `isPlacementOrientation(Property)` treats any property whose values are `Direction` or `Direction.Axis` as orientation, plus the known names in `ORIENTATION_PROPERTY_NAMES`. The old approach compared `Property` objects, and `HopperBlock.FACING` is a *different object* from `HorizontalDirectionalBlock.FACING`, so hoppers could never match. This also covers modded blocks, which bring their own property instances.
-- `hasPlacementOrientation(BlockState)`, `placementRotations(Rotation)` (aim, +90, +180, +270), `simulatePlacement(...)`, `simulatePlacementState(...)`, `withPlayerRotation(...)`, `placeContext(...)` — the placement is re-simulated from each candidate look direction, so choosing "which side to stand on" became a question the code can answer.
-- `placementSideFits(...)`, `computeFittingPlacementSides(...)`, `sideWouldPlace(...)`, cached in `fittingPlacementSides` — `placementGoal(...)` now walks to the side that can actually produce the wanted state instead of the first side that merely can be clicked.
-- `Placement.strictAim` — states with an orientation only get clicked once the hit is confirmed on the right face; "the look direction is roughly right" is not good enough for a log's `axis`, because a click on the wrong face produces the same block with the wrong axis, which then has to be mined and redone.
+### 新增 —— 不再无声卡死
 
-### Added — the builder no longer stalls forever
+一个停住不动的建造，以前需要人肉走一格才能继续，因为代码里没有任何东西会注意到它。现在有四道互相独立的保险丝：
 
-A build that stops moving used to need a human to walk one block, because nothing in the code noticed. Four independent guards now notice:
-
-| guard | limit | what it catches |
+| 保险丝 | 阈值 | 它抓的是什么 |
 | --- | --- | --- |
-| `CALC_FAIL_STREAK_LIMIT` | 60 | the pathfinder failing again and again for the same goal (`calcFailed` was previously ignored outright) |
-| `SATISFIED_STALL_LIMIT` | 40 | standing inside the goal, no path, no clicks — the classic "walk one block and it continues" deadlock |
-| `IDLE_STALL_LIMIT` | 200 | no path and no clicks at all |
-| `STILL_TICK_LIMIT` | 200 | a path that is being followed but does not move the player; the segment is force-cancelled |
+| `CALC_FAIL_STREAK_LIMIT` | 60 | 寻路器对同一个目标连续失败（`calcFailed` 以前被完全忽略） |
+| `SATISFIED_STALL_LIMIT` | 40 | 站在目标里、没路径、没点击 —— 经典的"走一格就好了"死锁 |
+| `IDLE_STALL_LIMIT` | 200 | 完全没有路径也没有点击 |
+| `STILL_TICK_LIMIT` | 200 | 有路径在跟，但玩家不动；直接强制取消这一段路径 |
 
-All four funnel into `escapeStall(reason)`: the positions the frozen goal was built from are added to `abandonedPlacements`, cached scans are dropped, counters reset, and the tick re-runs with the new plan. `resume` clears them again, so a manual "I moved, try now" works as before.
+四条都汇入 `escapeStall(reason)`：把那个冻住的目标所用的坐标塞进 `abandonedPlacements`、丢掉缓存扫描结果、清零计数器，然后带着新计划重跑这一 tick。`resume` 会把这些清空，所以"我挪位置了，再试一次"依然有效。
 
-### Added — layer scheduling could not move on
+### 新增 —— 层调度可以往前走了
 
-`BuilderLayerScheduler` gained `deferSlice()`, `clearDeferred()` and `deferredCount()`. When a slice has nothing it can do from where the player stands, the builder marks it as deferred and continues with the next one instead of pausing; the deferred set is walked again on the next pass and cleared by `reset()`/`resume()`.
+`BuilderLayerScheduler` 增加了 `deferSlice()`、`clearDeferred()`、`deferredCount()`。从玩家当前位置什么都做不了的那一层会被标记挂起、直接试下一层，而不是暂停；挂起的层会在下一轮重新走一遍，并由 `reset()`/`resume()` 清空。
 
-### Added — logging helpers and small APIs
+### 新增 —— 辅助方法
 
-- `BaritoneLog.goal(Object)` renders goals compactly. A `JankyComposite` used to be printed with all thirty `GoalAdjacent` children on every line, which is how a log reached 13 MB in eleven minutes.
-- `Settings.debug` (see above).
-- `PlacedBlocks.remember/isOurs/forget/clear` (new, `src/main/java/baritone/utils/PlacedBlocks.java`) — a 90-second registry of blocks the pathfinder placed for itself.
+- `BaritoneLog.goal(Object)` 紧凑地渲染目标。一个 `JankyComposite` 以前会把三十个 `GoalAdjacent` 子目标全部打印出来 —— 这就是日志十一分钟能写到 13 MB 的原因。
+- `PlacedBlocks.remember/isOurs/forget/clear`（新文件）—— 一份 90 秒的登记表，记录寻路器为自己放下的方块。
 
-### Fixed
+### 修复
 
-- **"Missing materials" for blocks that were in the inventory.** Material checks compared whole `BlockState`s against states guessed from a single `Direction.UP` hit, so any block with an axis (`oak_wood[axis=x]`, `[axis=z]`) could never match, and the build paused over blocks it was holding.
-- **`allowInventory true` still reported missing materials.** Only the hotbar was consulted; the main inventory (slots 9–35) was ignored even though the setting exists to use it.
-- **`resume` immediately paused again.** It kept the trimmed `incorrectPositions` set (everything beyond ~14 blocks removed), so the next tick believed the layer was finished. It now starts clean and clears deferred slices.
-- **The build paused over a single unreachable block.** Such positions are counted in `placementStruggles`; after `PLACEMENT_STRUGGLE_LIMIT` failures they are added to `abandonedPlacements` with one explanatory line, so the rest of the build proceeds and a `resume` retries them.
-- **Mining its own scaffolding.** `MovementHelper.attemptToPlaceABlock` places a throwaway block to walk on; `assemble` then saw that cell as "should be air" and mined it, after which the pathfinder placed it again — forever. Scaffolding placed by the pathfinder is now registered in `PlacedBlocks`, and it is only left alone **where the target wants air**; where the target wants a real block the scaffold is an obstruction like any other and gets broken.
-- **Breaking blocks that were nowhere near the route.** Breaking ran before placing and shared the placement radius (5 blocks), with no test for whether the block was actually in the way. The builder would stop mid-walk, chew through a few unrelated blocks, and leave the holes open. Breaking now has its own `BREAK_SCAN_RADIUS = 2`, runs **after** placing, and is skipped entirely while a path is being followed — obstacles on the route are the pathfinder's business, priced by `breakCostMultiplierAt`.
-- **Placing a block, mining it, placing it again.** Wrong-axis states came from clicking "approximately" and landing on the wrong face; those cells then had to be mined and redone, which is where the endless churn came from. Fixed by `Placement.strictAim` (see above).
-- **Clicking a spot forever without anything appearing.** `searchForPlacables` counted a *found* placement as a success and cleared every counter, so a position the client quietly refuses (the player's own bounding box is inside the cell, the support got dug out, the ray lands a hair off) was retried every tick with nothing recording it. Positions intersecting the player's bounding box are now skipped (`playerIsStandingIn`), and `[PLACE]` lines are written once per position instead of once per tick.
-- **Crash on the way into a world:** `NullPointerException` in `IPlayerContext.playerFeet` from `PathingBehavior.dispatchEvents` → `pathStart`. Java evaluates arguments before the call, so `pathStart()` ran even with the log disabled, and it reads the player position while no player exists. `dispatchEvents` now returns early when logging is off, `safePathStart()` renders `<no player>`, and `onTick` bails out while `ctx.player() == null`.
-- **Ticks lost to repeated trimming.** `trim()` (distance-based) ran every tick and shrank the candidate set to the player's surroundings; combined with `incorrectSize = 100` short-circuiting `fullRecalc`, "nothing left in this layer" was only ever true near the player. `assembleWholeBand` rescans the whole band, on a `WHOLE_BAND_RESCAN_TICKS = 10` cooldown so the fallback cannot stutter the tick loop.
+- **背包里明明有材料却报"缺少材料"。** 判料拿整个 `BlockState` 去比"按单个 `Direction.UP` 猜出来的状态"，所以任何带轴的方块（`oak_wood[axis=x]`、`[axis=z]`）永远匹配不上，建造就为一个自己背包里有的方块停住。
+- **`allowInventory true` 依然报缺少材料。** 只查了快捷栏，主背包 9–35 格被忽略，而这个设置存在的意义就是用它。
+- **`resume` 之后立刻又暂停。** 它保留了被裁剪过的 `incorrectPositions`（约 14 格外的东西全被删掉），于是下一 tick 就以为这层完工了。现在它从干净状态开始，并清空挂起的层。
+- **为一个够不到的方块把整个建造停掉。** 这类坐标会记进 `placementStruggles`，失败达到 `PLACEMENT_STRUGGLE_LIMIT` 次后加入 `abandonedPlacements` 并留一行解释，建造继续，`resume` 时再试。
+- **挖自己搭的脚手架。** `MovementHelper.attemptToPlaceABlock` 会垫一个临时方块好走过去；`assemble` 随后把那一格看成"应该是空气"把它挖了，寻路器再垫一次 —— 无限循环。现在寻路器放的脚手架登记在 `PlacedBlocks` 里，并且**只在目标要求空气的地方**才放过它；目标要求真方块的地方，脚手架跟别的障碍一样会被挖掉。
+- **挖掉根本不在路线上的方块。** 破坏以前跑在放置之前、和放置共用 5 格半径，而且从不判断方块是否真的挡路：建造器会走到一半停下、啃掉几个无关方块、把洞留在那里。现在破坏有自己的 `BREAK_SCAN_RADIUS = 2`、跑在放置**之后**，并且在跟随路径时整段跳过 —— 路线上的障碍是寻路器的事，由 `breakCostMultiplierAt` 计价。
+- **放了挖、挖了又放。** 错误朝向来自"大致瞄对就点"、结果点到别的面，那些格子随后又得挖掉重做，无限折腾就是从这里来的。由 `Placement.strictAim` 修掉（见上）。
+- **对着一个位置点个没完，方块就是不出现。** `searchForPlacables` 把"找到放置方案"当成成功并清掉所有计数器，于是客户端悄悄拒绝的位置（玩家自己的碰撞箱就在格子里、支撑被挖掉、射线差一点点）每 tick 都在重试，而且没有任何记录。现在与玩家碰撞箱相交的格子直接跳过（`playerIsStandingIn`），`[PLACE]` 每个位置只写一行，而不是每 tick 一行。
+- **进世界时崩溃：** `PathingBehavior.dispatchEvents` → `pathStart` 抛出 `IPlayerContext.playerFeet` 里的 `NullPointerException`。Java 在调用前先求值参数，所以即使日志关着 `pathStart()` 也照样跑了，而它在没有玩家时去读玩家坐标。现在 `dispatchEvents` 在日志关闭时提前返回，`safePathStart()` 会渲染成 `<no player>`，`onTick` 在 `ctx.player() == null` 时直接退出。
+- **被反复裁剪吃掉的 tick。** `trim()`（按距离裁剪）每 tick 都跑，把候选集缩小到玩家周围；再加上 `incorrectSize = 100` 会让 `fullRecalc` 提前返回，"这层没活了"只在玩家附近成立。`assembleWholeBand` 会重扫整个层带，并用 `WHOLE_BAND_RESCAN_TICKS = 10` 的冷却避免兜底逻辑把 tick 循环抖爆。
 
-### Changed — performance and scheduling
+### 变更 —— 性能与调度
 
-- `assemble(...)` builds a `HashSet` of placeable positions instead of calling `List.contains` per candidate (was O(n²) on every tick).
-- `approxPlaceable` is cached by an item-list snapshot (`refreshApproxPlaceable`) instead of being rebuilt from 36 slot stacks every tick.
-- `BuilderCalculationContext.placeable` follows `allowInventory` instead of always using the hotbar, and `costOfPlacingAt` uses `couldPlaceAs`; before, every block that was not in the hotbar gave its position `COST_INF`, which made A* discard and recompute whole path segments.
-- `toBreakNearPlayer` / `searchForPlacables` scan rings (closest first) with `VERTICAL_ORDER_PLACE` / `VERTICAL_ORDER_BREAK*` rather than a fixed `dx → dy → dz` sweep that started in the far corner of the box, so the block next to the player wins over one on the other side of the scan volume.
-- `hasAnyItemThatWouldPlace` filters hotbar slots by block identity before simulating a placement.
-- `onTick` order is now: place → break → inventory shuffle → local assemble (pocket) → local assemble (full) → missing-materials assemble → whole-band assemble → layer advance → defer slice → pause. Logging is folded into the same pass instead of a second traversal.
+- `assemble(...)` 先建一个可放置位置的 `HashSet`，不再对每个候选调 `List.contains`（以前每 tick 都是 O(n²)）。
+- `approxPlaceable` 按物品列表快照缓存（`refreshApproxPlaceable`），不再每 tick 拿 36 个槽位重建。
+- `BuilderCalculationContext.placeable` 跟随 `allowInventory`，不再固定只用快捷栏；`costOfPlacingAt` 改用 `couldPlaceAs`。以前任何不在快捷栏的方块都会让自己的位置变成 `COST_INF`，逼着 A* 丢弃并重算整段路径。
+- `toBreakNearPlayer` / `searchForPlacables` 改成由近到远的环形扫描（`VERTICAL_ORDER_PLACE` / `VERTICAL_ORDER_BREAK*`），而不是从扫描盒子的远角开始的固定 `dx → dy → dz` 遍历，于是玩家身边那块会优先于对面那块。
+- `hasAnyItemThatWouldPlace` 先按方块身份过滤快捷栏槽位，再去模拟放置。
+- `onTick` 现在的顺序是：放置 → 破坏 → 搬背包 → 局部 assemble（口袋）→ 局部 assemble（整层）→ 缺料 assemble → 整层带 assemble → 进层 → 挂起该层 → 暂停。日志并进同一趟，不再二次遍历。
 
-### Changed — logging volume
+### 变更 —— 日志量
 
-The first version of the log wrote everything and produced 13.6 MB / 44,018 lines in eleven minutes: `[TICK]` every 10 ticks, `[BEAT]` every 100, `[RECALC]`/`[ASSEMBLE]`/`[PLACE]` every tick, and every goal expanded in full.
+第一版日志什么都写，十一分钟产出 13.6 MB / 44,018 行：`[TICK]` 每 10 tick、`[BEAT]` 每 100 tick、`[RECALC]`/`[ASSEMBLE]`/`[PLACE]` 每 tick，而且每个目标都完整展开。
 
-- `[PLAN]` is written only when the plan changes (layer, pending work, abandoned count) plus a heartbeat every 200 ticks — the signature deliberately excludes values that change every tick.
-- `[PATH]` lines are deduplicated and goals are rendered by `BaritoneLog.goal`.
-- `describeGoal` → `BaritoneLog.goal` everywhere, including `findPathInNewThread`, which printed the raw composite goal.
-- `[BREAK]` is written once per target, `[PLACE]` once per position, `[ASSEMBLE]` only when the counts change.
-- The `#debug` history in this fork is exactly: full detail (too much) → trimmed (too little, and capped at 2 MB which silenced files mid-session) → the current set: configuration, decisions, and exceptions.
+- `[PLAN]` 只在计划变化时写（层、待处理数、被放弃数），外加每 200 tick 一次心跳 —— 签名刻意排除了每 tick 都会变的值。
+- `[PATH]` 去重，目标用 `BaritoneLog.goal` 渲染。
+- `describeGoal` 全部换成 `BaritoneLog.goal`，包括以前会打印原始复合目标的 `findPathInNewThread`。
+- `[BREAK]` 每个目标一行、`[PLACE]` 每个位置一行、`[ASSEMBLE]` 只在计数变化时写。
+- 这个 fork 里 `#debug` 的历史正好是：全量细节（太多）→ 精简（太少，而且 2 MB 上限会在会话中途把文件静音）→ 现在这一套：配置、决策、异常。
 
-### Reverted
+### 回滚
 
-- Placements always sneak. Removing the crouch was tried in `v1.21.11-layered.2` development; without it the click lands differently often enough (the support block eats it, the player edge-slides as the click goes out) that blocks came out in the wrong state and had to be mined and redone, which cost more time than the tick the crouch takes. The unconditional sneak is back.
+- 放置一律蹲下。曾经试过去掉蹲起，结果点击落点常常不一样（支撑方块把点击吃掉、玩家在点击发出的瞬间贴着边缘滑走），放出来的方块状态是错的、要挖掉重做，比蹲下花的那一个 tick 亏得多。所以无条件蹲下又回来了。
 
 ---
 
 ## v1.21.11-layered.1
 
-Layered pathfinding baseline: `#litematica` and `#selection fill` work through the target one horizontal Y layer at a time (`buildLayerSlicing`, `buildLayerSliceHeight`, `buildSliceSweepRadius`, `buildLayerAutoOrder`, `skipFailedLayers`), instead of planning across the whole volume at once.
+分层寻路基线：`#litematica` 与 `#selection fill` 按水平 Y 层逐层推进（`buildLayerSlicing`、`buildLayerSliceHeight`、`buildSliceSweepRadius`、`buildLayerAutoOrder`、`skipFailedLayers`），而不是一次性在整个三维体积上规划。
+
+---
+
+> English version: [CHANGELOG.en.md](CHANGELOG.en.md)

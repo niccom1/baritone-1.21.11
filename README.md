@@ -152,3 +152,16 @@ export JAVA_HOME=/path/to/jdk-21        # Windows: $env:JAVA_HOME="C:\path\to\jd
 - 原项目：**[cabaletta/baritone](https://github.com/cabaletta/baritone)**。所有核心寻路、建造、路径计算逻辑均来自上游；本仓库只修改了建造/填充的目标调度方式。
 - 修改部分（`BuilderLayerScheduler` 与 `BuilderProcess` 的分层调度代码）同样以 LGPL-3.0 发布。
 - 若你在自己的分支里复用本修改，请保留同样的致谢与许可证声明。
+
+---
+
+## 七、其他文档
+
+| 文档 | 中文 | 英文 |
+|---|---|---|
+| 更新日志 | [CHANGELOG.md](CHANGELOG.md) | [CHANGELOG.en.md](CHANGELOG.en.md) |
+| 安装 | [SETUP.md](SETUP.md) | [SETUP.en.md](SETUP.en.md) |
+| 用法 | [USAGE.md](USAGE.md) | [USAGE.en.md](USAGE.en.md) |
+| 寻路特性 | [FEATURES.md](FEATURES.md) | [FEATURES.en.md](FEATURES.en.md) |
+
+> English version of this README: [README.en.md](README.en.md)
