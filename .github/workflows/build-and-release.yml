@@ -1,0 +1,81 @@
+# Build the layered Baritone fork and attach the jars to a GitHub Release.
+#
+# Triggered by pushing a v* tag (e.g. v1.21.11-layered.1) or manually from the Actions tab.
+# The Gradle version comes from `git describe --tags`, so fetch-depth must stay 0.
+
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-and-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Gradle build (Fabric / Forge / NeoForge / Tweaker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew build --no-daemon --stacktrace
+
+      - name: Collect release jars
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          shopt -s nullglob
+          cp dist/*.jar release-assets/ 2>/dev/null || true
+          cp fabric/build/libs/*.jar release-assets/ 2>/dev/null || true
+          # drop intermediate jars, keep the remapped/proguarded ones
+          rm -f release-assets/*-dev.jar release-assets/*-dev-shadow.jar
+          echo "--- assets ---"
+          ls -lh release-assets
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: baritone-layered-jars
+          path: release-assets/*.jar
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*.jar
+          name: Layered Build ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          body: |
+            Layered build fork of [Baritone](https://github.com/cabaletta/baritone) for Minecraft 1.21.11.
+
+            This release makes `#litematica` and `#selection fill` work through the target one horizontal
+            Y layer at a time instead of jumping across the whole volume.
+
+            Use the `standalone` jar (or the Fabric remapped jar) in `.minecraft/mods`.
+            Licensed LGPL-3.0, same as upstream.
