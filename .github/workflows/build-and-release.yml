@@ -37,21 +37,19 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
-
+      # gradlew runs through bash on purpose: chmod'ing it changes the mode bits git tracks, which makes
+      # `git describe --dirty` report a dirty tree and bake a "-dirty" suffix into every artifact name.
       - name: Build with Gradle
-        run: ./gradlew build --no-daemon --stacktrace
+        run: bash ./gradlew build --no-daemon --stacktrace
 
       - name: Collect release jars
         run: |
           set -euo pipefail
           mkdir -p release-assets
           shopt -s nullglob
+          # dist/ already holds the proguarded api/standalone/unoptimized set for every loader, which is the
+          # distribution upstream ships; the extra remapped jars in fabric/build/libs would only duplicate it.
           cp dist/*.jar release-assets/ 2>/dev/null || true
-          cp fabric/build/libs/*.jar release-assets/ 2>/dev/null || true
-          # drop intermediate jars, keep the remapped/proguarded ones
-          rm -f release-assets/*-dev.jar release-assets/*-dev-shadow.jar
           echo "--- assets ---"
           ls -lh release-assets
 
