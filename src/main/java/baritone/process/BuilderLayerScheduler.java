@@ -119,7 +119,13 @@ public final class BuilderLayerScheduler {
     }
 
     /**
-     * Steps to the next band in the configured order, skipping nothing by itself.
+     * Steps to the next band in the configured order.
+     * <p>
+     * When the ordered sweep runs out, bands that were set aside earlier get their turn instead of the build being
+     * declared finished: a band that was set aside was waiting for a neighbour or for materials, and by the time the
+     * sweep reaches the end those neighbours usually exist. Without this pass the set-aside bands were only retried on
+     * {@code resume}, which is what made a layered build look like it had skipped a layer and then gone back to it much
+     * later, or never.
      *
      * @return {@code false} when there is no further band to work on
      */
@@ -127,11 +133,30 @@ public final class BuilderLayerScheduler {
         // this band is finished, so it does not have to be retried later
         deferred.remove(sliceIndex);
         int next = descending ? sliceIndex - 1 : sliceIndex + 1;
-        if (next < firstSliceIndex || next > lastSliceIndex) {
-            return false;
+        if (next >= firstSliceIndex && next <= lastSliceIndex) {
+            sliceIndex = next;
+            return true;
         }
-        sliceIndex = next;
-        return true;
+        if (retryDeferred()) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Moves the cursor to the nearest band that was set aside, in the configured direction.
+     *
+     * @return whether such a band was found
+     */
+    private boolean retryDeferred() {
+        while (!deferred.isEmpty()) {
+            // descending works from the top down, so the highest set-aside band is the nearest one to come back to
+            int candidate = descending ? deferred.last() : deferred.first();
+            deferred.remove(candidate);
+            sliceIndex = candidate;
+            return true;
+        }
+        return false;
     }
 
     /**

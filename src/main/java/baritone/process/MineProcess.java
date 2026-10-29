@@ -28,6 +28,7 @@ import baritone.api.utils.input.Input;
 import baritone.cache.CachedChunk;
 import baritone.pathing.movement.CalculationContext;
 import baritone.pathing.movement.MovementHelper;
+import baritone.utils.BaritoneLog;
 import baritone.utils.BaritoneProcessHelper;
 import baritone.utils.BlockStateInterface;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -234,6 +235,17 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         List<BlockPos> dropped = droppedItemsScan();
         List<BlockPos> locs = searchWorld(context, filter, Baritone.settings().mineMaxOreLocationsCount.value, already, blacklist, dropped);
         locs.addAll(dropped);
+        if (locs.isEmpty() && Baritone.settings().allowOnlyExposedOres.value) {
+            // everything worth mining is behind a cover layer, which is normal in a structure (an ore under a
+            // decorative block, a vein sealed by anything solid). Clearing the cover is part of the job, so look
+            // again without the line-of-sight filter before treating the target as gone.
+            locs = searchWorld(context, filter, Baritone.settings().mineMaxOreLocationsCount.value, already, blacklist, dropped, false);
+            locs.addAll(dropped);
+            if (!locs.isEmpty()) {
+                logDirect("The target is behind a cover, digging to it instead of giving up");
+                BaritoneLog.log("MINE", "exposure filter left nothing, %s buried target(s) recovered: %s", locs.size(), locs.get(0));
+            }
+        }
         if (locs.isEmpty() && !Baritone.settings().exploreForBlocks.value) {
             logDirect("No locations for " + filter + " known, cancelling");
             if (Baritone.settings().notificationOnMineFail.value) {
@@ -357,6 +369,19 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
     }
 
     public static List<BlockPos> searchWorld(CalculationContext ctx, BlockOptionalMetaLookup filter, int max, List<BlockPos> alreadyKnown, List<BlockPos> blacklist, List<BlockPos> dropped) {
+        return searchWorld(ctx, filter, max, alreadyKnown, blacklist, dropped, Baritone.settings().allowOnlyExposedOres.value);
+    }
+
+    /**
+     * @param requireExposed whether to drop targets that are not next to transparent blocks
+     * <p>
+     * The exposure filter exists so the player does not dig through a mountain to reach something buried. It is also
+     * the reason mining gave up on targets that only look buried: an ore under one layer of cover is not next to air
+     * anywhere, so it was filtered out, the location list came back empty and the whole job was cancelled. Reading
+     * "no reachable location" out of a list that was filtered by line of sight is not the same as "there is nothing
+     * left to mine", so the caller retries with this flag off before concluding that.
+     */
+    public static List<BlockPos> searchWorld(CalculationContext ctx, BlockOptionalMetaLookup filter, int max, List<BlockPos> alreadyKnown, List<BlockPos> blacklist, List<BlockPos> dropped, boolean requireExposed) {
         List<BlockPos> locs = new ArrayList<>();
         List<Block> untracked = new ArrayList<>();
         for (BlockOptionalMeta bom : filter.blocks()) {
@@ -377,7 +402,7 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
             }
         }
 
-        locs = prune(ctx, locs, filter, max, blacklist, dropped);
+        locs = prune(ctx, locs, filter, max, blacklist, dropped, requireExposed);
 
         if (!untracked.isEmpty() || (Baritone.settings().extendCacheOnThreshold.value && locs.size() < max)) {
             locs.addAll(BaritoneAPI.getProvider().getWorldScanner().scanChunkRadius(
@@ -391,7 +416,7 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
 
         locs.addAll(alreadyKnown);
 
-        return prune(ctx, locs, filter, max, blacklist, dropped);
+        return prune(ctx, locs, filter, max, blacklist, dropped, requireExposed);
     }
 
     private boolean addNearby() {
@@ -427,6 +452,10 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
     }
 
     private static List<BlockPos> prune(CalculationContext ctx, List<BlockPos> locs2, BlockOptionalMetaLookup filter, int max, List<BlockPos> blacklist, List<BlockPos> dropped) {
+        return prune(ctx, locs2, filter, max, blacklist, dropped, Baritone.settings().allowOnlyExposedOres.value);
+    }
+
+    private static List<BlockPos> prune(CalculationContext ctx, List<BlockPos> locs2, BlockOptionalMetaLookup filter, int max, List<BlockPos> blacklist, List<BlockPos> dropped, boolean requireExposed) {
         dropped.removeIf(drop -> {
             for (BlockPos pos : locs2) {
                 if (pos.distSqr(drop) <= 9 && filter.has(ctx.get(pos.getX(), pos.getY(), pos.getZ())) && MineProcess.plausibleToBreak(ctx, pos)) { // TODO maybe drop also has to be supported? no lava below?
@@ -446,7 +475,7 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
                 .filter(pos -> MineProcess.plausibleToBreak(ctx, pos))
 
                 .filter(pos -> {
-                    if (Baritone.settings().allowOnlyExposedOres.value) {
+                    if (requireExposed) {
                         return isNextToAir(ctx, pos);
                     } else {
                         return true;

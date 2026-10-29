@@ -55,6 +55,7 @@ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Vec3i;
+import net.minecraft.network.chat.Component;
 import net.minecraft.util.Tuple;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.BlockItem;
@@ -112,6 +113,24 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     private static final int PLACEMENT_STRUGGLE_LIMIT = 1200;
     /** How long the whole-band fallback scan stays quiet after it ran, in ticks. */
     private static final int WHOLE_BAND_RESCAN_TICKS = 10;
+    /**
+     * Ticks the builder waits for the click to land on the wanted face before leaving that target for later.
+     * <p>
+     * The click is only sent when the aimed face would really produce the wanted state, so this is not a retry budget
+     * for wrong states: it is the time the camera and the movement packets need to reach the face. Three seconds is
+     * generous for that, and short enough that one unreachable face cannot hold the whole band.
+     */
+    private static final int AIM_GIVE_UP_TICKS = 60;
+    /**
+     * Mine-and-replace rounds on one position before its state is accepted as it is.
+     * <p>
+     * Reachable when a block's state is decided by the world rather than by the click: putting it back reproduces the
+     * same state, so the seventh round would do exactly what the first six did. Six is past the point where a genuine
+     * placement mistake would still be plausible.
+     */
+    private static final int REPAIR_ROUND_LIMIT = 6;
+    /** How often the progress line is refreshed while the build is running, in ticks. */
+    private static final int STATUS_INTERVAL_TICKS = 40;
     /**
      * How many path calculations in a row may fail for the same goal before the builder gives up on the blocks it was
      * asking about and looks at the rest of the band instead.
@@ -185,6 +204,30 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     private final Set<BlockPos> loggedPlacements = new HashSet<>();
     /** The last assemble summary written to the log, so unchanged counts do not repeat. */
     private String lastAssembleSummary;
+    /**
+     * Properties whose value a placement cannot decide, learned per block.
+     * <p>
+     * Some states are not chosen by how the block is placed at all, they come out of the world afterwards: a rail
+     * picks its shape from its neighbours, and re-placing it in the same spot reproduces the same shape. Comparing the
+     * whole state then reports "wrong" forever, and the builder mines the block and puts it back. Once a difference is
+     * observed right after our own click, that property is written off for that block, and later comparisons of that
+     * block ignore it. Nothing is hardcoded per block type, the set stays empty until the world proves otherwise.
+     */
+    private final Map<Block, Set<Property<?>>> derivedProperties = new HashMap<>();
+    /** The block we last clicked for, so the next tick can compare what actually came out. */
+    private BetterBlockPos pendingPlacementPos;
+    private BlockState pendingPlacementWanted;
+    /** Positions where mine-and-replace has been tried and changed nothing, so it is not worth another round. */
+    private final Map<BlockPos, Integer> repairRounds = new HashMap<>();
+    /** Positions whose state is accepted as it is, because replacing them provably changes nothing. */
+    private final Set<BetterBlockPos> stateTolerated = new HashSet<>();
+    /** Ticks spent waiting for the click to land on the wanted face, per target position. */
+    private final Map<BetterBlockPos, Integer> aimTicks = new HashMap<>();
+    /** Targets given up on for the moment after the aim never landed, so the builder does something else. */
+    private final Set<BetterBlockPos> aimGiveUp = new HashSet<>();
+    /** Progress line bookkeeping: the hint lives and dies with the build instead of being printed once and left. */
+    private String lastStatusLine;
+    private int statusCountdown;
     public int stopAtHeight = 0;
 
     public BuilderProcess(Baritone baritone) {
@@ -427,6 +470,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                     if (desired == null) {
                         continue; // irrelevant
                     }
+                    if (stateTolerated.contains(new BetterBlockPos(x, y, z))) {
+                        continue; // replacing this one reproduces the same state, so leave it standing
+                    }
                     BlockState curr = bcc.bsi.get0(x, y, z);
                     // Same rule as in assemble: a scaffolding block may only be left alone where the target wants air.
                     // Where the target wants a real block the scaffold is an obstruction and gets broken like any other.
@@ -434,6 +480,20 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                     if (!(curr.getBlock() instanceof AirBlock) && !(curr.getBlock() == Blocks.WATER || curr.getBlock() == Blocks.LAVA) && !valid(curr, desired, false)
                             && !ourScaffolding) {
                         BetterBlockPos pos = new BetterBlockPos(x, y, z);
+                        // When the block that is standing there is already the right block, mining it only makes room
+                        // for the same block to come back: the state is decided by the world, not by how it is placed.
+                        // Count the rounds and stop at the limit instead of mining the same cell for the whole build.
+                        if (curr.getBlock() == desired.getBlock()) {
+                            int rounds = repairRounds.merge(pos, 1, Integer::sum);
+                            if (rounds > REPAIR_ROUND_LIMIT) {
+                                repairRounds.remove(pos);
+                                if (stateTolerated.add(pos)) {
+                                    BaritoneLog.log("STATE", "%s rounds of mine-and-replace at %s never produced %s (still %s), so it is accepted as it is",
+                                            rounds, pos, desired, curr);
+                                }
+                                continue;
+                            }
+                        }
                         Optional<Rotation> rot = RotationUtils.reachable(ctx, pos, ctx.playerController().getBlockReachDistance());
                         if (rot.isPresent()) {
                             if (!pos.equals(lastBreakLogged)) {
@@ -466,12 +526,21 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
          */
         private final boolean strictAim;
 
-        public Placement(int hotbarSelection, BlockPos placeAgainst, Direction side, Rotation rot, boolean strictAim) {
+        /**
+         * The state the schematic wants at the target cell.
+         * <p>
+         * Kept on the placement so the click itself can be checked against it: hitting the right block on the right
+         * face is only half of it, the state that face would produce has to be the wanted one as well.
+         */
+        private final BlockState desired;
+
+        public Placement(int hotbarSelection, BlockPos placeAgainst, Direction side, Rotation rot, boolean strictAim, BlockState desired) {
             this.hotbarSelection = hotbarSelection;
             this.placeAgainst = placeAgainst;
             this.side = side;
             this.rot = rot;
             this.strictAim = strictAim;
+            this.desired = desired;
         }
     }
 
@@ -501,6 +570,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                         if (playerIsStandingIn(x, y, z)) {
                             // The client refuses to place a block inside the player, so aiming at this one forever can
                             // never work. Move on; the goal machinery will walk somewhere else and come back to it.
+                            continue;
+                        }
+                        if (aimGiveUp.contains(candidate)) {
+                            // No look angle reached this face within the give-up window, so retrying it every tick
+                            // only holds the camera still. A resume clears the set and gives it another chance.
                             continue;
                         }
                         Optional<Placement> opt = possibleToPlace(desired, x, y, z, bcc.bsi);
@@ -594,6 +668,142 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         return voxelshape.isEmpty() || ctx.world().isUnobstructed(null, voxelshape.move(pos.getX(), pos.getY(), pos.getZ()));
     }
 
+    /**
+     * Compares the cell that was clicked last tick against the state that was asked for, and learns from the answer.
+     * <p>
+     * If the block that came out is the right block with a state that cannot be produced by placing it there, then
+     * that state is decided by the world rather than by the click, and no amount of mining and replacing will change
+     * it. The properties that differ are written off for that block, so later comparisons stop calling the cell wrong.
+     */
+    private void verifyPendingPlacement() {
+        BetterBlockPos pos = pendingPlacementPos;
+        BlockState wanted = pendingPlacementWanted;
+        pendingPlacementPos = null;
+        pendingPlacementWanted = null;
+        if (pos == null || wanted == null) {
+            return;
+        }
+        BlockState now = ctx.world().getBlockState(pos);
+        if (now.getBlock() != wanted.getBlock() || valid(now, wanted, false)) {
+            return; // nothing landed yet, or it landed exactly as asked
+        }
+        Set<Property<?>> learned = derivedProperties.computeIfAbsent(wanted.getBlock(), block -> new HashSet<>());
+        List<String> differing = new ArrayList<>();
+        for (Property<?> property : wanted.getProperties()) {
+            if (!samePropertyValue(now, wanted, property)) {
+                differing.add(property.getName());
+                learned.add(property);
+            }
+        }
+        if (!differing.isEmpty()) {
+            BaritoneLog.log("STATE", "placing %s at %s produced %s: %s cannot be set by the click, so this block type will not be replaced over it again",
+                    wanted, pos, now, differing);
+        }
+    }
+
+    /**
+     * @return whether both states agree on one property, without caring which property type it is
+     */
+    private static boolean samePropertyValue(BlockState first, BlockState second, Property<?> property) {
+        return propertyValue(first, property).equals(propertyValue(second, property));
+    }
+
+    private static <T extends Comparable<T>> Object propertyValue(BlockState state, Property<T> property) {
+        return state.getValue(property);
+    }
+
+    /**
+     * Keeps the progress hint in step with the build.
+     * <p>
+     * The builder used to announce "starting at layer 1/131" once, in the chat, and that line then sat there for the
+     * rest of the session: after the build finished it still said it was starting at layer 1. A status that outlives
+     * the state it describes is worse than no status, so the running description is sent to the action bar instead,
+     * where it fades on its own, and every state change (band finished, band set aside, build done) is a chat line of
+     * its own. Nothing is left behind to go stale.
+     */
+    private void offerStatus(boolean force) {
+        if (ctx.player() == null) {
+            return;
+        }
+        if (!force) {
+            if (statusCountdown > 0) {
+                statusCountdown--;
+                return;
+            }
+        }
+        statusCountdown = STATUS_INTERVAL_TICKS;
+        String line = statusLine();
+        if (line.equals(lastStatusLine)) {
+            return;
+        }
+        lastStatusLine = line;
+        ctx.player().displayClientMessage(Component.literal(line), true);
+    }
+
+    private String statusLine() {
+        StringBuilder builder = new StringBuilder("[Baritone] ");
+        if (layerScheduler != null && slicingActive()) {
+            builder.append(layerScheduler).append(" · ");
+        }
+        int pending = incorrectPositions == null ? 0 : incorrectPositions.size();
+        builder.append(pending).append(pending == 1 ? " block left" : " blocks left");
+        if (paused) {
+            builder.append(" · paused");
+        }
+        return builder.toString();
+    }
+
+    /**
+     * Clears the progress hint, for when the build stops being the thing that is happening.
+     */
+    private void clearStatus() {
+        if (ctx.player() == null) {
+            return;
+        }
+        lastStatusLine = null;
+        ctx.player().displayClientMessage(Component.empty(), true);
+    }
+
+    /**
+     * Checks whether the band the builder is working on is really finished, by looking at every cell in it.
+     * <p>
+     * {@code recalc} not finding anything is not the same thing: it looks at a radius around the player, it stops
+     * early once enough wrong positions are known, and it trims everything that is far away. Any of those makes a
+     * band with plenty of blocks left look empty, and the builder then moved on to the next band, which is why a long
+     * build jumped over a layer and came back to it much later (or never). Before a band is declared finished, it is
+     * swept in full once, and only an empty sweep counts.
+     *
+     * @return whether every cell of the current band already matches the schematic
+     */
+    private boolean bandIsComplete(BuilderCalculationContext bcc) {
+        if (!slicingActive()) {
+            return true;
+        }
+        int minY = Math.max(0, layerScheduler.sliceMinY());
+        int maxY = Math.min(schematic.heightY() - 1, layerScheduler.sliceMaxY());
+        for (int y = minY; y <= maxY; y++) {
+            for (int z = 0; z < schematic.lengthZ(); z++) {
+                for (int x = 0; x < schematic.widthX(); x++) {
+                    int blockX = x + origin.getX();
+                    int blockY = y + origin.getY();
+                    int blockZ = z + origin.getZ();
+                    BlockState current = bcc.bsi.get0(blockX, blockY, blockZ);
+                    if (!schematic.inSchematic(x, y, z, current)) {
+                        continue;
+                    }
+                    BlockState desired = bcc.getSchematic(blockX, blockY, blockZ, current);
+                    if (desired == null) {
+                        continue;
+                    }
+                    if (!valid(current, desired, false)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     private Optional<Placement> possibleToPlace(BlockState toPlace, int x, int y, int z, BlockStateInterface bsi) {
         // Only a block whose state depends on how it is placed is worth aiming at from four directions; for everything
         // else a sweep would just repeat the same ray trace four times.
@@ -636,7 +846,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                     }
                     OptionalInt hotbar = hasAnyItemThatWouldPlace(toPlace, result, actualRot);
                     if (hotbar.isPresent()) {
-                        return Optional.of(new Placement(hotbar.getAsInt(), placeAgainstPos, against.getOpposite(), rot, hasPlacementOrientation(toPlace)));
+                        return Optional.of(new Placement(hotbar.getAsInt(), placeAgainstPos, against.getOpposite(), rot, hasPlacementOrientation(toPlace), toPlace));
                     }
                 }
             }
@@ -826,6 +1036,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 calcFailStreak = 0;
             }
             logTickState(calcFailed, isSafeToCancel);
+            offerStatus(false);
         }
         if (paused) {
             return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
@@ -841,12 +1052,22 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             return null;
         }
         if (Baritone.settings().buildLayerSlicing.value && stopAtHeight > 0) {
+            boolean freshScheduler = false;
             if (layerScheduler == null) {
                 layerScheduler = createLayerScheduler();
+                freshScheduler = layerScheduler != null;
             }
             if (layerScheduler != null) {
-                logDirect("Working through the build one horizontal layer at a time, starting at " + layerScheduler);
+                // No chat line here on purpose: "starting at layer 1/131" printed once and left in the chat is what
+                // looked like a stuck status long after the build had moved on. The running position goes to the
+                // action bar (it fades by itself) and every band change gets its own chat line.
+                if (freshScheduler) {
+                    BaritoneLog.log("BUILD", "layered build starts at %s", layerScheduler);
+                }
                 schematic = new LayerSliceSchematic(realSchematic, layerScheduler);
+                if (freshScheduler) {
+                    offerStatus(true);
+                }
             }
         } else if (Baritone.settings().buildInLayers.value) {
             ISchematic realSchematic = this.realSchematic; // wrap this properly, dont just have the inner class refer to the builderprocess.this
@@ -905,10 +1126,38 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         BuilderCalculationContext bcc = new BuilderCalculationContext();
         if (!recalc(bcc)) {
             if (slicingActive()) {
-                if (layerScheduler.advance()) {
-                    logDirect("Layer finished, moving on to " + layerScheduler);
-                    incorrectPositions = null; // the next layer has to be scanned again, from the bottom of its own band
-                    return onTick(calcFailed, isSafeToCancel, recursions + 1);
+                if (bandIsComplete(bcc)) {
+                    if (layerScheduler.advance()) {
+                        logDirect("Layer finished, moving on to " + layerScheduler);
+                        BaritoneLog.log("BUILD", "band complete, cursor now %s", layerScheduler);
+                        incorrectPositions = null; // the next layer has to be scanned again, from the bottom of its own band
+                        aimTicks.clear();
+                        aimGiveUp.clear();
+                        offerStatus(true);
+                        return onTick(calcFailed, isSafeToCancel, recursions + 1);
+                    }
+                } else {
+                    // The scan around the player found nothing, but the band is not done: the remaining cells are out
+                    // of scan range, or the scan stopped early. Setting the band aside (instead of calling it
+                    // finished) keeps the wrong blocks on the books, and they get another turn once the rest of the
+                    // build has moved the builder closer.
+                    BaritoneLog.log("BUILD", "band %s is not complete yet, but nothing in it can be built from %s; setting it aside", layerScheduler, ctx.playerFeet());
+                    logDirect("Layer " + layerScheduler + " still has blocks left, but none of them can be built from here yet; coming back to it");
+                    if (layerScheduler.deferSlice()) {
+                        incorrectPositions = null;
+                        aimTicks.clear();
+                        aimGiveUp.clear();
+                        offerStatus(true);
+                        return onTick(calcFailed, isSafeToCancel, recursions + 1);
+                    }
+                    // Every band is waiting for something. Repeating the same scan tick after tick would spin, so the
+                    // build stops and says why instead of pretending it is finished.
+                    layerScheduler.clearDeferred();
+                    logDirect("Every layer is waiting for something (material, reach or a support to stand on), so the build is paused");
+                    logNotification("Every layer is waiting for something, build paused", true);
+                    paused = true;
+                    clearStatus();
+                    return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
                 }
             } else if (Baritone.settings().buildInLayers.value && layer * Baritone.settings().layerHeight.value < stopAtHeight) {
                 logDirect("Starting layer " + layer);
@@ -919,10 +1168,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             int max = Baritone.settings().buildRepeatCount.value;
             numRepeats++;
             if (repeat.equals(new Vec3i(0, 0, 0)) || (max != -1 && numRepeats >= max)) {
-                logDirect("Done building");
+                logDirect("Done building" + (layerScheduler == null ? "" : ", last band was " + layerScheduler));
                 if (Baritone.settings().notificationOnBuildFinished.value) {
                     logNotification("Done building", false);
                 }
+                clearStatus();
                 onLostControl();
                 return null;
             }
@@ -948,18 +1198,48 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         List<BlockState> desirableOnHotbar = new ArrayList<>();
         Optional<Placement> toPlace = searchForPlacables(bcc, desirableOnHotbar);
         retireImpossiblePlacements();
+        verifyPendingPlacement();
+        offerStatus(false);
         if (toPlace.isPresent() && isSafeToCancel && ctx.player().onGround() && ticks <= 0) {
-            Rotation rot = toPlace.get().rot;
+            Placement placement = toPlace.get();
+            Rotation rot = placement.rot;
             baritone.getLookBehavior().updateTarget(rot, true);
-            ctx.player().getInventory().setSelectedSlot(toPlace.get().hotbarSelection);
+            ctx.player().getInventory().setSelectedSlot(placement.hotbarSelection);
             // Every placement is made while sneaking. Removing it was tried and reverted: without the sneak the click
             // lands differently often enough (the support eats it, the player edge-slides while the click goes out)
             // that blocks came out in the wrong state and had to be mined and redone, which cost far more time than the
             // one tick the crouch takes.
             baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
-            boolean hitConfirmed = ctx.isLookingAt(toPlace.get().placeAgainst) && ((BlockHitResult) ctx.objectMouseOver()).getDirection().equals(toPlace.get().side);
-            if (hitConfirmed || (!toPlace.get().strictAim && ctx.playerRotations().isReallyCloseTo(rot))) {
+            BetterBlockPos target = new BetterBlockPos(placement.placeAgainst.relative(placement.side));
+            BlockHitResult over = ctx.objectMouseOver() instanceof BlockHitResult hit ? hit : null;
+            boolean onWantedFace = over != null
+                    && over.getBlockPos().equals(placement.placeAgainst)
+                    && over.getDirection() == placement.side
+                    && ctx.isLookingAt(placement.placeAgainst);
+            // A click on the right block but the wrong face produces the block in the wrong orientation, and then the
+            // builder mines it and tries again. The face is not the requirement, the state is: run the placement on
+            // the face that is actually under the crosshair and only click when the state that comes out of it is the
+            // one the schematic asked for. Otherwise hold the aim and let the camera settle, and give up on this
+            // target only after the aim has had a fair chance to get there.
+            boolean stateWouldMatch = onWantedFace && hasAnyItemThatWouldPlace(placement.desired, over, ctx.playerRotations()).isPresent();
+            if (stateWouldMatch) {
                 baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_RIGHT, true);
+                pendingPlacementPos = target;
+                pendingPlacementWanted = placement.desired;
+                aimTicks.remove(target);
+            } else if (onWantedFace) {
+                int aimed = aimTicks.merge(target, 1, Integer::sum);
+                if (aimed % 20 == 0) {
+                    BaritoneLog.log("AIM", "holding the click at %s: the face under the crosshair would not produce %s yet (tick %s)",
+                            target, placement.desired, aimed);
+                }
+                if (aimed >= AIM_GIVE_UP_TICKS) {
+                    aimTicks.remove(target);
+                    aimGiveUp.add(target);
+                    placementStruggles.merge(target, 40, Integer::sum);
+                    BaritoneLog.log("AIM", "no look reaches %s after %s ticks (%s, against %s), leaving it for now",
+                            target, aimed, placement.desired, placement.placeAgainst);
+                }
             }
             return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
         }
@@ -1131,6 +1411,17 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         lastBreakLogged = null;
         lastAssembleSummary = null;
         PlacedBlocks.clear();
+        // The aiming and repair bookkeeping is tied to one stance and one set of blocks in front of the player. A new
+        // build, a resume, or losing control all invalidate it: keeping it would leave positions marked as unreachable
+        // or as "good enough" from a place the player no longer stands in.
+        aimTicks.clear();
+        aimGiveUp.clear();
+        repairRounds.clear();
+        stateTolerated.clear();
+        pendingPlacementPos = null;
+        pendingPlacementWanted = null;
+        statusCountdown = 0;
+        clearStatus();
     }
 
     /**
@@ -1550,6 +1841,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                     // empty. Digging it out only makes the next path put it back, which is the loop where the builder
                     // and its own path fight over the same block. Cells the target wants filled are NOT skipped: there
                     // the scaffolding is in the way of a real block and has to be removed like any other obstruction.
+                } else if (stateTolerated.contains(pos)) {
+                    // mined and replaced REPAIR_ROUND_LIMIT times already and the state never changed: the block
+                    // there is the most this spot can hold, so it is not an obstruction worth mining again
                 } else {
                     breakable.add(pos);
                 }
@@ -2089,13 +2383,14 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         return false;
     }
 
-    private static boolean sameBlockstate(BlockState first, BlockState second) {
+    private boolean sameBlockstate(BlockState first, BlockState second) {
         if (first.getBlock() != second.getBlock()) {
             return false;
         }
         boolean ignoreDirection = Baritone.settings().buildIgnoreDirection.value;
         List<String> ignoredProps = Baritone.settings().buildIgnoreProperties.value;
-        if (!ignoreDirection && ignoredProps.isEmpty()) {
+        Set<Property<?>> derived = derivedProperties.get(first.getBlock());
+        if (!ignoreDirection && ignoredProps.isEmpty() && (derived == null || derived.isEmpty())) {
             return first.equals(second); // early return if no properties are being ignored
         }
         Map<Property<?>, Comparable<?>> map1 = first.getValues();
@@ -2103,6 +2398,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         for (Property<?> prop : map1.keySet()) {
             if (map1.get(prop) != map2.get(prop)
                     && !(ignoreDirection && isPlacementOrientation(prop))
+                    && (derived == null || !derived.contains(prop))
                     && !ignoredProps.contains(prop.getName())) {
                 return false;
             }
@@ -2110,7 +2406,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         return true;
     }
 
-    private static boolean containsBlockState(Collection<BlockState> states, BlockState state) {
+    private boolean containsBlockState(Collection<BlockState> states, BlockState state) {
         for (BlockState testee : states) {
             if (sameBlockstate(testee, state)) {
                 return true;
@@ -2130,7 +2426,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
      * result in {@link #hasAnyItemThatWouldPlace} and validates it strictly there, so being lenient here cannot place
      * the wrong block: it can only fail to find a spot for it, which the layer scheduler handles without pausing.
      */
-    private static boolean couldPlaceAs(BlockState desired, List<BlockState> placeable) {
+    private boolean couldPlaceAs(BlockState desired, List<BlockState> placeable) {
         if (containsBlockState(placeable, desired)) {
             return true;
         }
@@ -2145,11 +2441,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     /**
      * @return whether the item in one inventory slot could end up being {@code desired} once it is placed
      */
-    private static boolean couldPlaceFrom(BlockState candidate, BlockState desired) {
+    private boolean couldPlaceFrom(BlockState candidate, BlockState desired) {
         return valid(candidate, desired, true) || candidate.getBlock() == desired.getBlock();
     }
 
-    private static boolean valid(BlockState current, BlockState desired, boolean itemVerify) {
+    private boolean valid(BlockState current, BlockState desired, boolean itemVerify) {
         if (desired == null) {
             return true;
         }
