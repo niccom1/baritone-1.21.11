@@ -74,6 +74,47 @@ public class ToolSet {
         ItemTags.NETHERITE_TOOL_MATERIALS
     );
 
+    /**
+     * Mining asks for a tool set several times per tick, and every fresh instance starts with an empty
+     * {@link #breakStrengthCache}, so creating one per call meant the cache never got a hit. Reuse an
+     * instance while the hotbar and the player's effects stay the same.
+     */
+    private static LocalPlayer cachedPlayer;
+    private static ToolSet cachedToolSet;
+    private static long cachedFingerprint = Long.MIN_VALUE;
+    private static int cachedAtTick;
+
+    /**
+     * Guards against a stale cache when the hotbar is untouched but something time based changed,
+     * such as a haste potion running out.
+     */
+    private static final int CACHE_LIFETIME_TICKS = 100;
+
+    public static synchronized ToolSet cached(LocalPlayer player) {
+        if (player == null) {
+            return null;
+        }
+        long fingerprint = hotbarFingerprint(player);
+        if (player != cachedPlayer || fingerprint != cachedFingerprint || player.tickCount - cachedAtTick > CACHE_LIFETIME_TICKS) {
+            cachedPlayer = player;
+            cachedFingerprint = fingerprint;
+            cachedAtTick = player.tickCount;
+            cachedToolSet = new ToolSet(player);
+        }
+        return cachedToolSet;
+    }
+
+    private static long hotbarFingerprint(LocalPlayer player) {
+        long hash = 17L * player.getInventory().getSelectedSlot();
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            hash = hash * 31 + stack.getItem().hashCode();
+            hash = hash * 31 + stack.getCount();
+            hash = hash * 31 + stack.getDamageValue();
+        }
+        return hash;
+    }
+
     public ToolSet(LocalPlayer player) {
         breakStrengthCache = new HashMap<>();
         this.player = player;

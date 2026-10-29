@@ -1020,6 +1020,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             wholeBandCooldown--;
         }
         refreshApproxPlaceable();
+        // This is not the placement rate. It only keeps the builder from placing on the same tick it is mining:
+        // a forced left click sets it to 5 and the gate below skips placement until it drains. The actual rate
+        // is rightClickSpeed in BlockPlaceHelper, which delays every click by rightClickSpeed - 1 ticks.
         if (baritone.getInputOverrideHandler().isInputForcedDown(Input.CLICK_LEFT)) {
             ticks = 5;
         } else {
@@ -1200,7 +1203,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         retireImpossiblePlacements();
         verifyPendingPlacement();
         offerStatus(false);
-        if (toPlace.isPresent() && isSafeToCancel && ctx.player().onGround() && ticks <= 0) {
+        if (toPlace.isPresent() && isSafeToCancel && ctx.player().onGround() && ticks <= 0) { // see above: the gate is mining, the rate is rightClickSpeed
             Placement placement = toPlace.get();
             Rotation rot = placement.rot;
             baritone.getLookBehavior().updateTarget(rot, true);

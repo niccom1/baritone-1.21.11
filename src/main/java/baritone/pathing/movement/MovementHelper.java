@@ -648,7 +648,11 @@ public interface MovementHelper extends ActionCosts, Helper {
      * @param b   the blockstate to mine
      */
     static void switchToBestToolFor(IPlayerContext ctx, BlockState b) {
-        switchToBestToolFor(ctx, b, new ToolSet(ctx.player()), BaritoneAPI.getSettings().preferSilkTouch.value);
+        ToolSet ts = ToolSet.cached(ctx.player());
+        if (ts == null) {
+            return;
+        }
+        switchToBestToolFor(ctx, b, ts, BaritoneAPI.getSettings().preferSilkTouch.value);
     }
 
     /**

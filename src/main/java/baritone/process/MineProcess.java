@@ -63,6 +63,21 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
     private int desiredQuantity;
     private int tickCount;
 
+    /**
+     * Building the composite is the expensive half of {@link #updateGoal()}: it runs every pruned position
+     * through coalesce, which reads block states. The result only changes when those positions do, so it is
+     * kept between ticks and rebuilt when the pruned list or the blacklist moves.
+     */
+    private Goal goalCache;
+    private long goalCacheKey;
+    private int goalCacheTick;
+
+    /**
+     * updateGoal runs every mineGoalUpdateInterval ticks, so this covers roughly twenty ticks of reuse
+     * before the composite is rebuilt regardless, in case something outside the key changed.
+     */
+    private static final int GOAL_CACHE_TICKS = 4;
+
     public MineProcess(Baritone baritone) {
         super(baritone);
     }
@@ -174,6 +189,21 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         return "Mine " + filter;
     }
 
+    private Goal goalFor(List<BlockPos> locs, List<BlockPos> dropped, CalculationContext context) {
+        long key = 1125899906842597L;
+        for (BlockPos pos : locs) {
+            key = key * 31 + pos.asLong();
+        }
+        key = key * 31 + blacklist.size();
+        key = key * 31 + dropped.size();
+        if (goalCache == null || key != goalCacheKey || tickCount - goalCacheTick >= GOAL_CACHE_TICKS) {
+            goalCache = new GoalComposite(locs.stream().map(loc -> coalesce(loc, locs, context)).toArray(Goal[]::new));
+            goalCacheKey = key;
+            goalCacheTick = tickCount;
+        }
+        return goalCache;
+    }
+
     private PathingCommand updateGoal() {
         BlockOptionalMetaLookup filter = filterFilter();
         if (filter == null) {
@@ -184,9 +214,10 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         List<BlockPos> locs = knownOreLocations;
         if (!locs.isEmpty()) {
             CalculationContext context = new CalculationContext(baritone);
-            List<BlockPos> locs2 = prune(context, new ArrayList<>(locs), filter, Baritone.settings().mineMaxOreLocationsCount.value, blacklist, droppedItemsScan());
+            List<BlockPos> dropped = droppedItemsScan();
+            List<BlockPos> locs2 = prune(context, new ArrayList<>(locs), filter, Baritone.settings().mineMaxOreLocationsCount.value, blacklist, dropped);
             // can't reassign locs, gotta make a new var locs2, because we use it in a lambda right here, and variables you use in a lambda must be effectively final
-            Goal goal = new GoalComposite(locs2.stream().map(loc -> coalesce(loc, locs2, context)).toArray(Goal[]::new));
+            Goal goal = goalFor(locs2, dropped, context);
             knownOreLocations = locs2;
             return new PathingCommand(goal, legit ? PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH : PathingCommandType.REVALIDATE_GOAL_AND_PATH);
         }
