@@ -1,10 +1,10 @@
-# Baritone 1.21.11 寻路优化版
+ Baritone 1.21.11 寻路优化版
 
-这是 [cabaletta/baritone](https://github.com/cabaletta/baritone) 的非官方修改版，用在 Minecraft 1.21.11 上，Fabric、Forge、NeoForge 都有构建产物。
+这是 [cabaletta/baritone](https://github.com/cabaletta/baritone) 的非官方修改版由**DeepSeek V4.1Flash 1017**协助完成，用在 Minecraft 1.21.11 上，Fabric、Forge、NeoForge 都有构建产物。
 
 寻路算法本身没有重写。改的是建造任务怎么向寻路要目标，以及放置方块时怎么判断这一格算不算做好了。
 
-## 改了什么
+ 改了什么
 
 原版会把整个建造目标一次性交给寻路器。目标体积一大，玩家就在不同高度、不同角落之间来回跑，路径反复重算，一层还没做完就跑去很远的地方补一格。
 
@@ -18,46 +18,46 @@
 - 寻路给自己垫的垫脚方块不会被 builder 拆掉。原来两边互相拆台，能一直循环下去。
 - 连续几秒没有进展、算路连续失败、有路径却一步没动，都会换目标或者放弃那几格，不会原地不动等人去推一把。
 - 一层的待办里如果有几格暂时放不出来（没材料、够不着、没有可以点的面），这层先记下来跳到下一层，扫完一轮再回来，不会直接跳过整层。
-- `#mine` 挖被一层方块盖住的矿物时，会先挖开覆盖层继续挖，不再当成没有目标直接退出。
+-  #mine 挖被一层方块盖住的矿物时，会先挖开覆盖层继续挖，不再当成没有目标直接退出。
 - 游戏崩溃的三处来源都补了防守：目标被抢走后残留的 `stopAtHeight`、扫描时集合被置空、进程列表在遍历中被改写。
 
-## 新增的设置
+ 新增的设置
 
-- `buildLayerSlicing`，默认 `true`。分层调度总开关，关掉就回到原版的整片目标集。
-- `buildLayerSliceHeight`，默认 `1`。每层多少格高。
-- `buildSliceSweepRadius`，默认 `8`。层内口袋的水平半径，设为 0 就不做局部限制。
-- `buildLayerAutoOrder`，默认 `true`。按挖掘和放置的比例自动决定层是从下往上还是从上往下，关掉就用 `layerOrder` 的值。
-- `debug`，默认 `false`。写调试日志，位置和内容见 [GUIDE.md](GUIDE.md)。
+- buildLayerSlicing，默认 true。分层调度总开关，关掉就回到原版的整片目标集。
+- buildLayerSliceHeight，默认 1。每层多少格高。
+- buildSliceSweepRadius，默认 8 。层内口袋的水平半径，设为 0 就不做局部限制。
+- buildLayerAutoOrder，默认 true。按挖掘和放置的比例自动决定层是从下往上还是从上往下，关掉就用 `layerOrder` 的值。
+- debug`，默认 `false。写调试日志，位置和内容见 [GUIDE.md](GUIDE.md)。
 
 改法是在游戏里输入，例如：
 
-```
+
 #set buildSliceSweepRadius 12
 #set buildLayerSliceHeight 3
 #set debug true
-```
 
-## 安装与构建
+
+ 安装与构建
 
 安装：装好对应加载器和 Java 21，把对应加载器的 jar 放进 `mods`。Fabric 还需要 Fabric API。
 
 构建要求 JDK 21，Gradle 8.14.4 在 JDK 25 上跑不起来。
 
-```bash
+bash
 export JAVA_HOME=/path/to/jdk-21
 
 ./gradlew :fabric:remapJar     # 一个能用的 mod jar
 ./gradlew build                # 全部加载器，产物在 dist/
-```
+
 
 首次构建要下载 Minecraft、映射表和依赖，时间比较长。
 
 详细的安装步骤、常用命令和调试日志说明都在 [GUIDE.md](GUIDE.md)。
 
-## 许可证
+ 许可证
 
 继承上游 LGPL-3.0，见 [LICENSE](LICENSE)。核心的寻路、路径计算、建造流程都来自上游，本仓库改的是建造目标的调度方式和放置判定。改动部分同样以 LGPL-3.0 发布。上游更新后本仓库不保证跟随，需要标准 Baritone 请直接用上游。
 
----
+
 
 > English version: [README.en.md](README.en.md)
