@@ -27,12 +27,14 @@ import baritone.api.utils.*;
 import baritone.api.utils.input.Input;
 import baritone.cache.CachedChunk;
 import baritone.pathing.movement.CalculationContext;
+import baritone.pathing.path.PathExecutor;
 import baritone.pathing.movement.MovementHelper;
 import baritone.utils.BaritoneLog;
 import baritone.utils.BaritoneProcessHelper;
 import baritone.utils.BlockStateInterface;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
@@ -40,6 +42,10 @@ import net.minecraft.world.level.block.AirBlock;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.FallingBlock;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.state.BlockState;
 
 import java.util.*;
@@ -57,6 +63,16 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
     private BlockOptionalMetaLookup filter;
     private List<BlockPos> knownOreLocations;
     private List<BlockPos> blacklist; // inaccessible
+    // A cell the search failed to reach is skipped for a while, not for the rest of the run: a bridge, a mined
+    // shaft or simply a different angle can make it reachable again, and hiding it forever is what left ores
+    // unhighlighted and never scheduled.
+    private final Map<BlockPos, Integer> blacklistedUntil = new HashMap<>();
+    private static final int BLACKLIST_TTL_TICKS = 1200;
+    // Cells that were within reach but had no visible face from anywhere around them. They are skipped on a
+    // cooldown for the same reason: this is a fact about the current stance, not about the ore.
+    private final Map<BlockPos, Integer> noSightCooldown = new HashMap<>();
+    private static final int NO_SIGHT_COOLDOWN_TICKS = 600;
+    private int lastTrackedLogged = -1;
     private Map<BlockPos, Long> anticipatedDrops;
     private BlockPos branchPoint;
     private GoalRunAway branchPointRunaway;
@@ -82,6 +98,24 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
      */
     private static final double UNREACHABLE_CLUSTER_SQR = 9.0D;
 
+    /**
+     * Cheap prefilter for candidates worth a line of sight check. The real limit is the block reach distance; this
+     * only keeps that raycast off all sixty four known positions on every tick.
+     */
+    private static final double IN_REACH_SQR = 25.0D;
+    // The block being mined is kept across ticks on purpose. Two equally distant ores used to trade places every
+    // tick, which retargeted the look every tick, and a look that never settles never opens a click.
+    private BlockPos breakTarget;
+    // A cell that has line of sight to a target no face of which is reachable from where the player stands.
+    private BlockPos approachStance;
+    private BlockPos approachFor;
+    private int approachAtTick;
+    private static final int APPROACH_CACHE_TICKS = 40;
+    private static final double EYE_HEIGHT = 1.62D;
+    // Ticks spent on a target with no visible face anywhere around it, so an impossible target is dropped instead of
+    // being waited on forever.
+    private final Map<BlockPos, Integer> noSightTicks = new HashMap<>();
+    private static final int NO_SIGHT_LIMIT = 60;
     /** A goal rebuild that takes longer than this is worth a line in the debug log. */
     private static final long SLOW_GOAL_UPDATE_MS = 20L;
 
@@ -123,6 +157,8 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
                     List<BlockPos> cluster = knownOreLocations.stream()
                             .filter(pos -> pos.distSqr(closest) <= UNREACHABLE_CLUSTER_SQR)
                             .collect(Collectors.toList());
+                    int until = tickCount + BLACKLIST_TTL_TICKS;
+                    cluster.forEach(pos -> blacklistedUntil.put(pos, until));
                     blacklist.addAll(cluster);
                     knownOreLocations.removeIf(blacklist::contains);
                     BaritoneLog.log("MINE", "no path to %s, blacklisting %s position(s) around it instead of one, so the next search does not spend another failure timeout on the same pile", closest, cluster.size());
@@ -137,6 +173,11 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
             }
         }
 
+        if (!blacklistedUntil.isEmpty()) {
+            int now = tickCount;
+            blacklist.removeIf(pos -> blacklistedUntil.getOrDefault(pos, 0) <= now);
+            blacklistedUntil.keySet().retainAll(blacklist);
+        }
         updateLoucaSystem();
         int mineGoalUpdateInterval = Baritone.settings().mineGoalUpdateInterval.value;
         List<BlockPos> curr = new ArrayList<>(knownOreLocations);
@@ -150,24 +191,40 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
                 return null;
             }
         }
-        Optional<BlockPos> shaft = curr.stream()
-                .filter(pos -> pos.getX() == ctx.playerFeet().getX() && pos.getZ() == ctx.playerFeet().getZ())
-                .filter(pos -> pos.getY() >= ctx.playerFeet().getY())
-                .filter(pos -> !(BlockStateInterface.get(ctx, pos).getBlock() instanceof AirBlock)) // after breaking a block, it takes mineGoalUpdateInterval ticks for it to actually update this list =(
-                .min(Comparator.comparingDouble(ctx.playerFeet().above()::distSqr));
+        // Pathing only breaks blocks it walks through, so a target that already counts as reached from where the
+        // player stands is never touched: standing under an overhead ore is exactly that case, and the old code only
+        // handled targets in the player's own column. Break whatever is in reach from here, in any direction.
+        BlockPos feetNow = ctx.playerFeet();
         baritone.getInputOverrideHandler().clearAllKeys();
-        if (shaft.isPresent() && ctx.player().onGround()) {
-            BlockPos pos = shaft.get();
-            BlockState state = baritone.bsi.get0(pos);
-            if (!MovementHelper.avoidBreaking(baritone.bsi, pos.getX(), pos.getY(), pos.getZ(), state)) {
-                Optional<Rotation> rot = RotationUtils.reachable(ctx, pos);
-                if (rot.isPresent() && isSafeToCancel) {
+        BlockPos target = chooseBreakTarget(curr, feetNow);
+        if (target != null && ctx.player().onGround() && isSafeToCancel) {
+            BlockState state = baritone.bsi.get0(target);
+            if (!MovementHelper.avoidBreaking(baritone.bsi, target.getX(), target.getY(), target.getZ(), state)) {
+                Optional<Rotation> rot = RotationUtils.reachable(ctx, target);
+                if (rot.isPresent()) {
                     baritone.getLookBehavior().updateTarget(rot.get(), true);
-                    MovementHelper.switchToBestToolFor(ctx, ctx.world().getBlockState(pos));
-                    if (ctx.isLookingAt(pos) || ctx.playerRotations().isReallyCloseTo(rot.get())) {
+                    MovementHelper.switchToBestToolFor(ctx, ctx.world().getBlockState(target));
+                    if (ctx.isLookingAt(target) || ctx.playerRotations().isReallyCloseTo(rot.get())) {
                         baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_LEFT, true);
                     }
                     return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+                }
+                // Every face is covered from where the player stands, so no look angle reaches the block, and the
+                // goal that covers it already counts as satisfied: that combination is what made mine sit still
+                // until the player moved. Walk to a cell with a clean shot at one of its faces instead.
+                BlockPos stance = stanceLookingAt(target);
+                if (stance != null && !stance.equals(feetNow)) {
+                    BaritoneLog.log("MINE", "no face of %s at %s is visible from %s, walking to %s to get a clean shot", state, target, feetNow, stance);
+                    return new PathingCommand(new GoalBlock(stance), PathingCommandType.REVALIDATE_GOAL_AND_PATH);
+                }
+                int noSight = noSightTicks.merge(target, 1, Integer::sum);
+                if (stance == null && noSight >= NO_SIGHT_LIMIT) {
+                    noSightTicks.remove(target);
+                    breakTarget = null;
+                    approachStance = null;
+                    approachFor = null;
+                    noSightCooldown.put(target, tickCount + NO_SIGHT_COOLDOWN_TICKS);
+                    BaritoneLog.log("MINE", "no cell around %s at %s can see a face of it right now, so it is skipped for %s ticks instead of being dropped", state, target, NO_SIGHT_COOLDOWN_TICKS);
                 }
             }
         }
@@ -214,6 +271,12 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
 
     @Override
     public void onLostControl() {
+        breakTarget = null;
+        approachStance = null;
+        approachFor = null;
+        noSightTicks.clear();
+        noSightCooldown.clear();
+        blacklistedUntil.clear();
         mine(0, (BlockOptionalMetaLookup) null);
     }
 
@@ -222,15 +285,102 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         return "Mine " + filter;
     }
 
+    /**
+     * The block currently being mined. Kept across ticks so the aim has a chance to settle: picking the nearest
+     * target every tick flips between equally distant ores, and a look target that changes every tick never lines up.
+     */
+    private BlockPos chooseBreakTarget(List<BlockPos> curr, BlockPos feet) {
+        if (breakTarget != null) {
+            boolean usable = !(BlockStateInterface.get(ctx, breakTarget).getBlock() instanceof AirBlock)
+                    && breakTarget.distSqr(feet) <= IN_REACH_SQR
+                    && curr.contains(breakTarget)
+                    && noSightCooldown.getOrDefault(breakTarget, 0) <= tickCount;
+            if (usable) {
+                return breakTarget;
+            }
+            noSightTicks.remove(breakTarget);
+            breakTarget = null;
+        }
+        BlockPos best = curr.stream()
+                .filter(pos -> !(BlockStateInterface.get(ctx, pos).getBlock() instanceof AirBlock)) // after breaking a block, it takes mineGoalUpdateInterval ticks for it to actually update this list =(
+                .filter(pos -> pos.distSqr(feet) <= IN_REACH_SQR)
+                .filter(pos -> noSightCooldown.getOrDefault(pos, 0) <= tickCount)
+                .min(Comparator.comparingDouble((BlockPos pos) -> pos.distSqr(feet)).thenComparingLong(BlockPos::asLong))
+                .orElse(null);
+        if (best != null) {
+            breakTarget = best;
+            BaritoneLog.log("MINE", "breaking %s at %s from %s%s", BlockStateInterface.get(ctx, best).getBlock(), best, feet,
+                    best.distSqr(feet) > 4 ? ": within reach, but off the path the search would take" : "");
+        }
+        return best;
+    }
+
+    /**
+     * A cell from which at least one face of {@code target} is exposed. A block whose every reachable face is covered
+     * cannot be hit from any angle at the current position, so the way to mine it is to stand somewhere else.
+     */
+    private BlockPos stanceLookingAt(BlockPos target) {
+        if (approachFor != null && approachFor.equals(target) && approachStance != null && tickCount - approachAtTick < APPROACH_CACHE_TICKS) {
+            return approachStance;
+        }
+        approachFor = target;
+        approachAtTick = tickCount;
+        approachStance = null;
+        double reach = ctx.playerController().getBlockReachDistance();
+        Vec3 center = new Vec3(target.getX() + 0.5D, target.getY() + 0.5D, target.getZ() + 0.5D);
+        List<BlockPos> candidates = new ArrayList<>(12);
+        for (Direction side : Direction.values()) {
+            BlockPos adjacent = target.relative(side);
+            if (canStandAt(adjacent)) {
+                candidates.add(adjacent);
+            }
+            BlockPos belowAdjacent = adjacent.below();
+            if (canStandAt(belowAdjacent)) {
+                candidates.add(belowAdjacent);
+            }
+        }
+        for (BlockPos candidate : candidates) {
+            Vec3 eyes = new Vec3(candidate.getX() + 0.5D, candidate.getY() + EYE_HEIGHT, candidate.getZ() + 0.5D);
+            for (Direction face : Direction.values()) {
+                Vec3 point = center.add(new Vec3(face.getStepX(), face.getStepY(), face.getStepZ()).scale(0.5001D));
+                if (eyes.distanceTo(point) > reach) {
+                    continue;
+                }
+                BlockHitResult hit = ctx.world().clip(new ClipContext(eyes, point, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, ctx.player()));
+                if (hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(target)) {
+                    approachStance = candidate;
+                    return candidate;
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean canStandAt(BlockPos pos) {
+        if (!(ctx.world().getBlockState(pos).getBlock() instanceof AirBlock)) {
+            return false;
+        }
+        if (!(ctx.world().getBlockState(pos.above()).getBlock() instanceof AirBlock)) {
+            return false;
+        }
+        return !ctx.world().getBlockState(pos.below()).getCollisionShape(ctx.world(), pos.below()).isEmpty();
+    }
+
     private Goal goalFor(List<BlockPos> locs, List<BlockPos> dropped, CalculationContext context) {
+        // A composite with hundreds of members widens the frontier and slows every recalculation down, so only
+        // the closest few become goals. The rest stay in knownOreLocations, where they still show up as targets
+        // and come up again as soon as the near ones are gone.
+        int limit = Math.max(1, Baritone.settings().mineMaxOreLocationsCount.value);
+        List<BlockPos> near = locs.size() > limit ? locs.subList(0, limit) : locs;
         long key = 1125899906842597L;
-        for (BlockPos pos : locs) {
+        for (BlockPos pos : near) {
             key = key * 31 + pos.asLong();
         }
         key = key * 31 + blacklist.size();
         key = key * 31 + dropped.size();
+        key = key * 31 + limit;
         if (goalCache == null || key != goalCacheKey || tickCount - goalCacheTick >= GOAL_CACHE_TICKS) {
-            goalCache = new GoalComposite(locs.stream().map(loc -> coalesce(loc, locs, context)).toArray(Goal[]::new));
+            goalCache = new GoalComposite(near.stream().map(loc -> coalesce(loc, near, context)).toArray(Goal[]::new));
             goalCacheKey = key;
             goalCacheTick = tickCount;
         }
@@ -249,10 +399,35 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
             CalculationContext context = new CalculationContext(baritone);
             List<BlockPos> dropped = droppedItemsScan();
             List<BlockPos> locs2 = prune(context, new ArrayList<>(locs), filter, Baritone.settings().mineMaxOreLocationsCount.value, blacklist, dropped);
+            // A mined cell stays in the list while its drop lies there, and a composite of goals reads as reached as
+            // soon as any single member is reached. Keeping a cell that no longer holds the ore therefore makes the
+            // whole objective look finished while untouched ores wait, which is the idle loop where mine stands under
+            // a diamond and never swings. Only positions that still hold the target may build goals; drops keep being
+            // tracked separately for the loiter logic.
+            int candidates = locs2.size();
+            locs2.removeIf(pos -> context.bsi.isLoaded(pos.getX(), pos.getZ()) && !filter.has(context.bsi.get0(pos)));
+            int stale = candidates - locs2.size();
+            if (stale > 0) {
+                // Logging this every prune flooded the log four times a second with the same sentence, and building
+                // that sentence stringifies the whole filter each time.
+                BaritoneLog.log("MINE", "dropped %s stale target position(s): those cells no longer hold %s, and a goal there would count as reached", stale, filter);
+            }
             // can't reassign locs, gotta make a new var locs2, because we use it in a lambda right here, and variables you use in a lambda must be effectively final
-            Goal goal = goalFor(locs2, dropped, context);
             knownOreLocations = locs2;
-            return new PathingCommand(goal, legit ? PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH : PathingCommandType.REVALIDATE_GOAL_AND_PATH);
+            if (locs2.size() != lastTrackedLogged) {
+                // One line whenever the tracked set changes size: it makes it obvious whether every ore in view is
+                // actually being tracked, which is what the highlight boxes are drawn from.
+                lastTrackedLogged = locs2.size();
+                BaritoneLog.log("MINE", "tracking %s target position(s), the closest %s of them are goals right now", locs2.size(), Math.min(locs2.size(), Baritone.settings().mineMaxOreLocationsCount.value));
+            }
+            if (!locs2.isEmpty()) {
+                Goal goal = goalFor(locs2, dropped, context);
+                PathingCommandType type = legit ? PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH : PathingCommandType.REVALIDATE_GOAL_AND_PATH;
+                return new PathingCommand(goal, type);
+            }
+            // every known position turned out to be stale, so there is nothing to dig here; fall through to the
+            // explore branch instead of handing the pathfinder an empty composite, which it can never satisfy
+            BaritoneLog.log("MINE", "no target position is left to dig, falling back to exploring for more");
         }
         // we don't know any ore locations at the moment
         if (!legit && !Baritone.settings().exploreForBlocks.value) {
@@ -555,9 +730,11 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
                 .sorted(Comparator.comparingDouble(ctx.getBaritone().getPlayerContext().player().blockPosition()::distSqr))
                 .collect(Collectors.toList());
 
-        if (locs.size() > max) {
-            return locs.subList(0, max);
-        }
+        // Deliberately not truncated here. max is a budget for how much one scan pass collects, but trimming
+        // the result is what made ores disappear: anything past the closest N cells never entered
+        // knownOreLocations, so it was never highlighted and never scheduled, however long the run went on.
+        // goalFor() limits how many of them become goals instead, which keeps the search frontier small
+        // without losing targets.
         return locs;
     }
 
@@ -610,6 +787,9 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         this.desiredQuantity = quantity;
         this.knownOreLocations = new ArrayList<>();
         this.blacklist = new ArrayList<>();
+        this.blacklistedUntil.clear();
+        this.noSightCooldown.clear();
+        this.lastTrackedLogged = -1;
         this.branchPoint = null;
         this.branchPointRunaway = null;
         this.anticipatedDrops = new HashMap<>();
