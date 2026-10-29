@@ -105,8 +105,8 @@ public final class PathingBehavior extends Behavior implements IPathingBehavior,
                         BaritoneLog.goal(goal),
                         safePathStart(),
                         isPathing(),
-                        current == null ? "<none>" : current.getPath().getDest().toShortString(),
-                        next == null ? "<none>" : next.getPath().getDest().toShortString(),
+                        destOf(current),
+                        destOf(next),
                         inProgress == null ? "<none>" : inProgress.getClass().getSimpleName());
                 if (!line.equals(lastLoggedPathLine)) {
                     lastLoggedPathLine = line;
@@ -115,6 +115,20 @@ public final class PathingBehavior extends Behavior implements IPathingBehavior,
             }
             baritone.getGameEventHandler().onPathEvent(event);
         }
+    }
+
+    /**
+     * @return the destination of an executor's path, or a placeholder when there is no path yet
+     * <p>
+     * A freshly created executor has a path object that is still null, and the log line below runs on every path event,
+     * so dereferencing it directly was a null pointer waiting for the first path of a session.
+     */
+    private static String destOf(PathExecutor executor) {
+        if (executor == null) {
+            return "<none>";
+        }
+        IPath path = executor.getPath();
+        return path == null ? "<no path>" : path.getDest().toShortString();
     }
 
     /** {@link #pathStart()} throws while there is no player, which is the case on ticks outside a world. */

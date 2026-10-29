@@ -66,6 +66,8 @@ public final class BaritoneLog {
     private static final long MAX_BYTES = 8_000_000L;
     private static long bytesWritten;
     private static boolean capped;
+    /** the value of the toggle on the previous call, so turning it back on can start a fresh file */
+    private static boolean lastEnabled;
     /** whether {@link #file} is the file inside the save directory, rather than the fallback in the game directory */
     private static boolean worldBound;
 
@@ -82,11 +84,25 @@ public final class BaritoneLog {
      * @return whether the user asked for a debug log with {@code #debug true}
      */
     public static boolean enabled() {
+        boolean now;
         try {
-            return BaritoneAPI.getSettings().debug.value;
+            now = BaritoneAPI.getSettings().debug.value;
         } catch (Throwable t) {
-            return false;
+            now = false;
         }
+        if (now && !lastEnabled) {
+            // Turning the log back on is what the cap message tells the player to do, and it is also the obvious way to
+            // ask for a fresh file, so the budget and the truncation flag come back with it. Without this the file was
+            // written once, hit the cap, and stayed silent for the rest of the session no matter what the toggle said.
+            closeQuietly();
+            file = null;
+            truncated = false;
+            bytesWritten = 0L;
+            capped = false;
+            worldBound = false;
+        }
+        lastEnabled = now;
+        return now;
     }
 
     /**
@@ -248,6 +264,18 @@ public final class BaritoneLog {
                 return out;
             }
             if (out != null) {
+                if (file != null && !Files.exists(file)) {
+                    // The player deleted the log while it was open. The handle stays valid, so every further line went
+                    // into a file with no directory entry left and no new file was ever created: deleting the log used
+                    // to silence it until the game was restarted. Start over instead.
+                    closeQuietly();
+                    file = null;
+                    truncated = false;
+                    bytesWritten = 0L;
+                    capped = false;
+                    worldBound = false;
+                    return ensureOpen();
+                }
                 // The very first line is written while Baritone is being constructed, which happens before a world is
                 // loaded, so the path used to be pinned to the game directory for the whole session and the file never
                 // showed up in the save folder. Relocate to the save directory as soon as one exists, and never move

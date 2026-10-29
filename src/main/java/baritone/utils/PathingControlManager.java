@@ -36,6 +36,8 @@ public class PathingControlManager implements IPathingControlManager {
     private final Baritone baritone;
     private final HashSet<IBaritoneProcess> processes; // unGh
     private final List<IBaritoneProcess> active;
+    /** guards against a process asking for a nested pass while this one is still walking the list */
+    private boolean executing;
     private IBaritoneProcess inControlLastTick;
     private IBaritoneProcess inControlThisTick;
     private PathingCommand command;
@@ -178,7 +180,29 @@ public class PathingControlManager implements IPathingControlManager {
     }
 
 
+    /**
+     * Runs one pass over the processes.
+     * <p>
+     * A process can start a path calculation, and that calculation reports back inside the same tick, which re-enters
+     * this method. The nested pass then adds to or removes from {@link #active} while the outer loop is iterating it,
+     * and the iterator throws {@link java.util.ConcurrentModificationException} straight into the client tick - one of
+     * the ways this mod used to take the game down. A nested pass cannot decide anything the outer one will not, so it
+     * is turned into a no-op, and the loop below walks a snapshot so the live list can change under it.
+     */
     public PathingCommand executeProcesses() {
+        if (executing) {
+            BaritoneLog.log("PATH", "a nested process pass was requested while one was running, ignoring it");
+            return command;
+        }
+        executing = true;
+        try {
+            return executeProcesses0();
+        } finally {
+            executing = false;
+        }
+    }
+
+    private PathingCommand executeProcesses0() {
         for (IBaritoneProcess process : processes) {
             if (process.isActive()) {
                 if (!active.contains(process)) {
@@ -192,7 +216,7 @@ public class PathingControlManager implements IPathingControlManager {
         // ties are broken by which was added to the beginning of the list first
         active.sort(Comparator.comparingDouble(IBaritoneProcess::priority).reversed());
 
-        Iterator<IBaritoneProcess> iterator = active.iterator();
+        Iterator<IBaritoneProcess> iterator = new ArrayList<>(active).iterator();
         while (iterator.hasNext()) {
             IBaritoneProcess proc = iterator.next();
 

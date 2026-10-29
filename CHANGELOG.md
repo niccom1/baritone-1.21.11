@@ -4,6 +4,50 @@
 
 ---
 
+## v1.21.11-layered.3
+
+这一版处理两个问题：建造途中因为空指针崩掉游戏，以及调试日志删掉之后再也不写。
+
+### 修复：空指针崩溃
+
+崩溃栈落在 `BuilderProcess.isRemovalHeavy(BuilderProcess.java:1345)`，原因是 `target` 为 null：
+
+```
+Cannot invoke "baritone.api.schematic.ISchematic.widthX()" because "target" is null
+  at baritone.process.BuilderProcess.isRemovalHeavy(BuilderProcess.java:1345)
+  at baritone.process.BuilderProcess.createLayerScheduler(BuilderProcess.java:1326)
+  at baritone.process.BuilderProcess.onTick(BuilderProcess.java:836)
+```
+
+触发顺序是这样的。`onLostControl()` 会把 `schematic`、`realSchematic`、`layerScheduler` 全部置空，但 `stopAtHeight` 留着上一次建造的值（日志里是 131）。别的进程抢走控制权时，这一串调用发生在一个 tick 的中途，接下来的代码仍然按老目标往下走：`realSchematic = schematic` 拿到 null，`buildLayerSlicing && stopAtHeight > 0` 依然成立，于是给一个已经不在的目标创建层调度器，采样时直接解引用 null。
+
+改动：
+
+- `onLostControl()` 补上 `stopAtHeight = 0`。
+- `onTick` 在取到目标之后立刻判断：`realSchematic` 仍为 null 就写一行 `ticked without a target, stopping`，调用 `onLostControl()` 再返回 null。先置为不活动再返回，`PathingControlManager` 才不会再抛 `actively returned null PathingCommand`。
+- `createLayerScheduler()` 遇到 null 目标返回 null，调用处只在拿到调度器时才包装 `LayerSliceSchematic`。
+- `isRemovalHeavy(null)` 返回 false。
+
+### 修复：调试日志不再写入
+
+两种情形都会让日志静默，原因不同：
+
+- 文件被删掉。句柄还开着，Windows 和 POSIX 都允许删除已打开的文件，之后每一行写进一个没有目录项的 inode，新文件永远不会出现，直到重启游戏。现在每次写之前检查文件是否还在，不在就重新创建并补上文件头。
+- 写满 8 MB 之后按提示 `#debug false` 再 `#debug true`。提示这么写，代码里却没有对应的重置，`capped` 一置为 true 就只能重启。现在 `enabled()` 记录上一次的开关状态，重新打开时清空字节计数、`capped` 和截断标记，等于换一个新文件。
+
+### 顺带收紧的地方
+
+复查主流程和寻路时顺手补的约束，正常路径行为不变：
+
+- `PathingControlManager.executeProcesses()` 加可重入守卫，并且遍历 `active` 的副本。进程在 tick 中途发起寻路会重入这个方法，嵌套的一遍改到 `active`，外层迭代器就抛 `ConcurrentModificationException`，这是另一种能直接把游戏带崩的写法。
+- `PathingBehavior` 新增 `destOf(PathExecutor)`。新建的执行器 `getPath()` 可能是 null，而这条日志每个路径事件都写。
+- `BuilderProcess` 里 `trim()`、`selectSweepPocket()`、`assemble(...)` 都会在 `incorrectPositions` 被清空后仍可能被调用，补空判断；`assemble` 的候选集合为 null 时返回 null。
+- `approxPlaceable`、`refreshApproxPlaceable` 不再假设背包一定有 36 格，越界补空；`subList(0, 9)` 换成 `hotbarOnly`，列表短于一个快捷栏时直接用原列表。
+- `BuilderCalculationContext.getSchematic` 判空，这个内部类持有的是构造时的目标快照。
+- `startAtHeight / layerHeight` 用 `Math.max(1, ...)`，`layerHeight` 是可设置项，设成 0 以前会除零。
+
+---
+
 ## v1.21.11-layered.2
 
 这一版主要在修建造器长时间运行时的可靠性：无故暂停、误判材料、拆掉自己刚放下的方块、留下空洞。每条都能对上一次实际建造的日志或崩溃报告。

@@ -6,6 +6,48 @@ The fork keeps upstream Baritone's layered builder (`#litematica`, `#selection f
 
 ---
 
+## v1.21.11-layered.3
+
+Two problems this time: the game crashed with a null pointer in the middle of a build, and the debug log stopped writing once its file was deleted.
+
+### Fixed: the null pointer crash
+
+The stack landed in `BuilderProcess.isRemovalHeavy(BuilderProcess.java:1345)` with a null target:
+
+```
+Cannot invoke "baritone.api.schematic.ISchematic.widthX()" because "target" is null
+  at baritone.process.BuilderProcess.isRemovalHeavy(BuilderProcess.java:1345)
+  at baritone.process.BuilderProcess.createLayerScheduler(BuilderProcess.java:1326)
+  at baritone.process.BuilderProcess.onTick(BuilderProcess.java:836)
+```
+
+`onLostControl()` cleared `schematic`, `realSchematic` and `layerScheduler`, but left `stopAtHeight` at the value of the build that just ended (131 in that session). Another process taking control runs that cleanup in the middle of a tick, so the rest of the tick kept going with the old target: `realSchematic = schematic` produced null, `buildLayerSlicing && stopAtHeight > 0` was still true, and a layer scheduler was built for a target that no longer existed.
+
+- `onLostControl()` now clears `stopAtHeight`.
+- `onTick` checks the target right after resolving it: if it is still null it logs `ticked without a target, stopping`, calls `onLostControl()` and returns null. Reporting inactive first is what keeps `PathingControlManager` from throwing `actively returned null PathingCommand`.
+- `createLayerScheduler()` returns null without a target, and the caller only wraps `LayerSliceSchematic` when it got one.
+- `isRemovalHeavy(null)` returns false.
+
+### Fixed: the debug log went silent
+
+Two separate causes:
+
+- The file was deleted while it was open. The handle stays valid on Windows and POSIX, so every later line went into an inode with no directory entry and no new file was ever created until the game restarted. It now checks that the file still exists before writing and recreates it, header included.
+- The 8 MB cap. The message told the player to toggle `#debug` off and on, but nothing implemented that reset, so `capped` stayed true for the session. `enabled()` now remembers the previous toggle state and clears the byte count, `capped` and the truncation flag when the log is turned back on.
+
+### Tightened while reviewing
+
+Guards added during the review pass, with normal behaviour unchanged:
+
+- `PathingControlManager.executeProcesses()` has a reentrancy guard and iterates a copy of `active`. A process starting a path calculation re-enters this method mid tick; the nested pass modified `active` and the outer iterator threw `ConcurrentModificationException`, which is another way this mod could take the client down.
+- `PathingBehavior` got `destOf(PathExecutor)`; a freshly built executor can have a null path and this line is written on every path event.
+- `trim()`, `selectSweepPocket()` and `assemble(...)` in `BuilderProcess` no longer assume the pending set is present, since `onLostControl` and the stall handling both clear it.
+- `approxPlaceable` and `refreshApproxPlaceable` no longer assume 36 inventory slots, and `subList(0, 9)` became `hotbarOnly`, which keeps a short list as it is.
+- `getSchematic` inside the calculation context checks its snapshot.
+- `startAtHeight / layerHeight` divides by `Math.max(1, ...)`; `layerHeight` is a setting and a zero used to be a division by zero.
+
+---
+
 ## v1.21.11-layered.2
 
 This release is about one thing: the builder stopped being reliable on long, high-stress builds. It used to pause for no reason, misjudge which materials it had, fight itself over blocks it had just placed, and leave holes behind. Everything below addresses a concrete log or crash report from a real build session.

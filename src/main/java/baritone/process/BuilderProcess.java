@@ -60,6 +60,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.item.context.UseOnContext;
 import net.minecraft.world.level.block.*;
@@ -239,7 +240,8 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 if (minim.isPresent() && maxim.isPresent()) {
                     int startAtHeight = Baritone.settings().layerOrder.value ? y + schematic.heightY() - maxim.getAsInt() : minim.getAsInt() - y;
                     this.stopAtHeight = (Baritone.settings().layerOrder.value ? y + schematic.heightY() - minim.getAsInt() : maxim.getAsInt() - y) + 1;
-                    this.layer = Math.max(this.layer, startAtHeight / Baritone.settings().layerHeight.value);  // startAtLayer or startAtHeight, whichever is highest
+                    // layerHeight is a user setting and can be zero, which used to divide this straight into a crash
+                    this.layer = Math.max(this.layer, startAtHeight / Math.max(1, Baritone.settings().layerHeight.value));  // startAtLayer or startAtHeight, whichever is highest
                     logDebug(String.format("Schematic starts at y=%s with height %s", y, schematic.heightY()));
                     logDebug(String.format("Selection starts at y=%s and ends at y=%s", minim.getAsInt(), maxim.getAsInt()));
                     logDebug(String.format("Considering relevant height %s - %s", startAtHeight, this.stopAtHeight));
@@ -831,12 +833,21 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         if (realSchematic == null) {
             realSchematic = schematic;
         }
+        if (realSchematic == null) {
+            // Another process took control and onLostControl already ran, but this tick was still in flight. Reporting
+            // inactive here is what keeps PathingControlManager happy; trying to slice a target that is gone is not.
+            BaritoneLog.log("BUILD", "ticked without a target, stopping");
+            onLostControl();
+            return null;
+        }
         if (Baritone.settings().buildLayerSlicing.value && stopAtHeight > 0) {
             if (layerScheduler == null) {
                 layerScheduler = createLayerScheduler();
-                logDirect("Working through the build one horizontal layer at a time, starting at " + layerScheduler);
             }
-            schematic = new LayerSliceSchematic(realSchematic, layerScheduler);
+            if (layerScheduler != null) {
+                logDirect("Working through the build one horizontal layer at a time, starting at " + layerScheduler);
+                schematic = new LayerSliceSchematic(realSchematic, layerScheduler);
+            }
         } else if (Baritone.settings().buildInLayers.value) {
             ISchematic realSchematic = this.realSchematic; // wrap this properly, dont just have the inner class refer to the builderprocess.this
             int minYInclusive;
@@ -1010,7 +1021,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         // a short local one instead of a trip to the far corner of the layer. With allowInventory the whole inventory
         // counts rather than just the hotbar: a block sitting in the main inventory is one inventory move away from
         // being placeable, and counting only the hotbar is what made the builder call it a missing material.
-        List<BlockState> reachablePlaceable = Baritone.settings().allowInventory.value ? approxPlaceable : approxPlaceable.subList(0, 9);
+        List<BlockState> reachablePlaceable = Baritone.settings().allowInventory.value ? approxPlaceable : hotbarOnly(approxPlaceable);
         Collection<BetterBlockPos> sweepPocket = selectSweepPocket();
         Goal goal = assemble(bcc, reachablePlaceable, false, sweepPocket);
         if (goal == null && sweepPocket != incorrectPositions) {
@@ -1159,7 +1170,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
                 calcFailed,
                 isSafeToCancel,
                 ticks,
-                approxPlaceable.size(),
+                approxPlaceable == null ? 0 : approxPlaceable.size(),
                 Baritone.settings().allowInventory.value ? "whole inventory" : "hotbar only",
                 describeGoal(current));
     }
@@ -1225,6 +1236,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     }
 
     private void trim() {
+        if (incorrectPositions == null || ctx.player() == null) {
+            return;
+        }
         HashSet<BetterBlockPos> copy = new HashSet<>(incorrectPositions);
         copy.removeIf(pos -> pos.distSqr(ctx.player().blockPosition()) > 200);
         if (!copy.isEmpty()) {
@@ -1319,7 +1333,10 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
      * Sets up the layer cursor for the schematic that is currently being built.
      */
     private BuilderLayerScheduler createLayerScheduler() {
-        int sliceHeight = Baritone.settings().buildLayerSliceHeight.value;
+        if (realSchematic == null) {
+            return null;
+        }
+        int sliceHeight = Math.max(1, Baritone.settings().buildLayerSliceHeight.value);
         // startAtLayer counts layers of layerHeight, which is what the old buildInLayers cursor used as well
         int startAtY = layer * Baritone.settings().layerHeight.value;
         int stopAtY = stopAtHeight > 0 ? stopAtHeight : realSchematic.heightY();
@@ -1337,6 +1354,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
      * @return {@code true} when more sampled blocks have to be removed than placed
      */
     private boolean isRemovalHeavy(ISchematic target) {
+        if (target == null) {
+            return false;
+        }
         if (!Baritone.settings().buildLayerAutoOrder.value) {
             return false; // the user asked for layerOrder to make this decision
         }
@@ -1388,6 +1408,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
      * @return the pending blocks inside the pocket, or all of them when the restriction is disabled
      */
     private Collection<BetterBlockPos> selectSweepPocket() {
+        if (incorrectPositions == null || ctx.player() == null) {
+            return incorrectPositions;
+        }
         int radius = Baritone.settings().buildSliceSweepRadius.value;
         if (radius <= 0 || incorrectPositions.size() <= 1) {
             return incorrectPositions;
@@ -1475,6 +1498,10 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     }
 
     private Goal assemble(BuilderCalculationContext bcc, List<BlockState> approxPlaceable, boolean logMissing) {
+        if (incorrectPositions == null) {
+            // escapeStall and onLostControl both drop the set; a tick that is still in flight must not dereference it
+            return null;
+        }
         return assemble(bcc, approxPlaceable, logMissing, incorrectPositions);
     }
 
@@ -1485,6 +1512,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
      * @param candidates the pending blocks that are allowed to contribute a goal, in any order
      */
     private Goal assemble(BuilderCalculationContext bcc, List<BlockState> approxPlaceable, boolean logMissing, Collection<BetterBlockPos> candidates) {
+        if (candidates == null) {
+            return null;
+        }
         List<BetterBlockPos> placeable = new ArrayList<>();
         List<BetterBlockPos> breakable = new ArrayList<>();
         List<BetterBlockPos> sourceLiquids = new ArrayList<>();
@@ -1918,6 +1948,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         schematic = null;
         realSchematic = null;
         layerScheduler = null;
+        // This used to survive onLostControl. The slicing branch below keys off it, so the next tick tried to build a
+        // scheduler for a target that no longer existed and threw a NullPointerException out of isRemovalHeavy.
+        stopAtHeight = 0;
         layer = Baritone.settings().startAtLayer.value;
         numRepeats = 0;
         paused = false;
@@ -1969,10 +2002,13 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
      * every tick, so rebuilding it on a tick where the inventory did not change is pure waste.
      */
     private void refreshApproxPlaceable() {
+        if (ctx.player() == null) {
+            return;
+        }
         List<ItemStack> items = ctx.player().getInventory().getNonEquipmentItems();
         List<Item> snapshot = new ArrayList<>(36);
         for (int i = 0; i < 36; i++) {
-            snapshot.add(items.get(i).getItem());
+            snapshot.add(i < items.size() ? items.get(i).getItem() : Items.AIR);
         }
         if (approxPlaceable != null && snapshot.equals(approxPlaceableSnapshot)) {
             return;
@@ -1981,10 +2017,24 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         approxPlaceable = approxPlaceable(36);
     }
 
+    /**
+     * @return the hotbar part of the placeable list, or the whole list when it is shorter than a hotbar
+     */
+    private static List<BlockState> hotbarOnly(List<BlockState> placeable) {
+        if (placeable == null) {
+            return Collections.emptyList();
+        }
+        return placeable.size() <= 9 ? placeable : placeable.subList(0, 9);
+    }
+
     private List<BlockState> approxPlaceable(int size) {
         List<BlockState> result = new ArrayList<>();
+        if (ctx.player() == null) {
+            return result;
+        }
+        List<ItemStack> items = ctx.player().getInventory().getNonEquipmentItems();
         for (int i = 0; i < size; i++) {
-            ItemStack stack = ctx.player().getInventory().getNonEquipmentItems().get(i);
+            ItemStack stack = i < items.size() ? items.get(i) : ItemStack.EMPTY;
             if (stack.isEmpty() || !(stack.getItem() instanceof BlockItem)) {
                 result.add(Blocks.AIR.defaultBlockState());
                 continue;
@@ -2162,6 +2212,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
 
         private BlockState getSchematic(int x, int y, int z, BlockState current) {
+            if (schematic == null) {
+                // This context snapshots the target when it is built, and the pathfinder keeps asking it for placement
+                // costs for the rest of the search. A build that is cancelled mid-tick leaves it holding null.
+                return null;
+            }
             if (schematic.inSchematic(x - originX, y - originY, z - originZ, current)) {
                 return schematic.desiredState(x - originX, y - originY, z - originZ, current, BuilderProcess.this.approxPlaceable);
             } else {
