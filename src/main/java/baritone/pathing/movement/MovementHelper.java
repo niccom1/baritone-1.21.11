@@ -38,6 +38,7 @@ import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.enchantment.Enchantment;
 import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.item.enchantment.ItemEnchantments;
+import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.piston.MovingPistonBlock;
 import net.minecraft.world.level.block.state.BlockState;
@@ -47,6 +48,7 @@ import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.world.level.block.state.properties.StairsShape;
 import net.minecraft.world.level.material.*;
 import net.minecraft.world.level.pathfinder.PathComputationType;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
@@ -863,6 +865,33 @@ public interface MovementHelper extends ActionCosts, Helper {
         return b instanceof AirBlock ||
                 b == Blocks.LAVA ||
                 b == Blocks.WATER;
+    }
+
+    /**
+     * Whether this block fills its cell, so that nothing behind it can be seen or clicked. Slabs, stairs,
+     * fences, walls, sculk veins and every other partial block are not full cubes.
+     */
+    public static boolean isFullBlock(BlockState state, BlockGetter world, BlockPos pos) {
+        return Block.isShapeFullBlock(state.getShape(world, pos));
+    }
+
+    /**
+     * Whether this block is decorative clutter with next to no volume, such as a sculk vein. Something with an
+     * empty collision shape can be walked through and clicked past, so it cannot count as covering a block; the
+     * same goes for a shape whose bounding box is negligible. Treating partial blocks as covers is what made a
+     * vein on top of an ore hide the ore from the exposure filter.
+     */
+    public static boolean isLowProfileCover(BlockState state, BlockGetter world, BlockPos pos) {
+        if (state.isAir()) {
+            return true;
+        }
+        if (state.getCollisionShape(world, pos).isEmpty()) {
+            return true;
+        }
+        AABB box = state.getShape(world, pos).bounds();
+        double volume = (box.maxX - box.minX) * (box.maxY - box.minY) * (box.maxZ - box.minZ);
+        // a quarter of a block: sculk veins and rails come out far below this, a slab sits at half
+        return volume <= 0.25D;
     }
 
     static List<BetterBlockPos> steppingOnBlocks(IPlayerContext ctx) {

@@ -72,6 +72,19 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
     private long goalCacheKey;
     private int goalCacheTick;
 
+    private PathingCommand lastCommand;
+    private int lastCommandTick;
+
+    /**
+     * Positions around a failed target that are dropped together with it. A search that cannot reach one ore in a
+     * pile cannot reach its neighbours either, and every attempt costs a full failure timeout before the tick
+     * resumes, which is the pause that was showing up as a two second freeze at block edges.
+     */
+    private static final double UNREACHABLE_CLUSTER_SQR = 9.0D;
+
+    /** A goal rebuild that takes longer than this is worth a line in the debug log. */
+    private static final long SLOW_GOAL_UPDATE_MS = 20L;
+
     /**
      * updateGoal runs every mineGoalUpdateInterval ticks, so this covers roughly twenty ticks of reuse
      * before the composite is rebuilt regardless, in case something outside the key changed.
@@ -105,8 +118,15 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
                 if (Baritone.settings().notificationOnMineFail.value) {
                     logNotification("Unable to find any path to " + filter + ", blacklisting presumably unreachable closest instance...", true);
                 }
-                knownOreLocations.stream().min(Comparator.comparingDouble(ctx.playerFeet()::distSqr)).ifPresent(blacklist::add);
-                knownOreLocations.removeIf(blacklist::contains);
+                BlockPos closest = knownOreLocations.stream().min(Comparator.comparingDouble(ctx.playerFeet()::distSqr)).orElse(null);
+                if (closest != null) {
+                    List<BlockPos> cluster = knownOreLocations.stream()
+                            .filter(pos -> pos.distSqr(closest) <= UNREACHABLE_CLUSTER_SQR)
+                            .collect(Collectors.toList());
+                    blacklist.addAll(cluster);
+                    knownOreLocations.removeIf(blacklist::contains);
+                    BaritoneLog.log("MINE", "no path to %s, blacklisting %s position(s) around it instead of one, so the next search does not spend another failure timeout on the same pile", closest, cluster.size());
+                }
             } else {
                 logDirect("Unable to find any path to " + filter + ", canceling mine");
                 if (Baritone.settings().notificationOnMineFail.value) {
@@ -151,7 +171,20 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
                 }
             }
         }
-        PathingCommand command = updateGoal();
+        int updateInterval = Math.max(1, Baritone.settings().mineGoalUpdateInterval.value);
+        PathingCommand command;
+        if (lastCommand == null || tickCount - lastCommandTick >= updateInterval) {
+            long startedAt = System.nanoTime();
+            command = updateGoal();
+            lastCommandTick = tickCount;
+            long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
+            if (elapsedMs >= SLOW_GOAL_UPDATE_MS) {
+                BaritoneLog.log("MINE", "goal update took %sms over %s known position(s)", elapsedMs, knownOreLocations == null ? 0 : knownOreLocations.size());
+            }
+            lastCommand = command;
+        } else {
+            command = lastCommand;
+        }
         if (command == null) {
             // none in range
             // maybe say something in chat? (ahem impact)
@@ -533,8 +566,14 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         for (int dx = -radius; dx <= radius; dx++) {
             for (int dy = -radius; dy <= radius; dy++) {
                 for (int dz = -radius; dz <= radius; dz++) {
-                    if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) <= radius
-                            && MovementHelper.isTransparent(ctx.getBlock(pos.getX() + dx, pos.getY() + dy, pos.getZ() + dz))) {
+                    if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > radius) {
+                        continue;
+                    }
+                    BlockPos at = pos.offset(dx, dy, dz);
+                    BlockState state = ctx.get(at);
+                    // air, water and lava are open by definition; a partial block such as a sculk vein, a rail or a
+                    // torch does not hide anything either, so an ore under one of those is still minable
+                    if (MovementHelper.isTransparent(state.getBlock()) || MovementHelper.isLowProfileCover(state, ctx.world, at)) {
                         return true;
                     }
                 }
